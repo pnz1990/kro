@@ -1255,7 +1255,7 @@ func lookupSchemaAtField(schema *spec.Schema, field string) *spec.Schema {
 func validateAndCompileNode(builderCache *celcache.BuilderCache, sessionCache *celcache.SessionCache, node *Node, inspector *ast.Inspector, env *cel.Env, nodeSchema *spec.Schema, typeProvider *krocel.DeclTypeProvider) error {
 	// Virtual nodes have no template; compile their expressions separately.
 	if node.Meta.Type == NodeTypeSpecPatch {
-		return validateAndCompileSpecPatchNode(env, inspector, node)
+		return validateAndCompileSpecPatchNode(sessionCache, env, inspector, node)
 	}
 	if node.Meta.Type == NodeTypeStateWrite {
 		return validateAndCompileStateWriteNode(env, inspector, node)
@@ -1460,9 +1460,9 @@ func validateAndCompileIncludeWhen(sessionCache *celcache.SessionCache, env *cel
 // expressions for a NodeTypeSpecPatch node. The compiled programs are stored back
 // into node.IncludeWhen[i].Program. Patch expressions are compiled and stored in
 // node.CompiledSpecPatch.
-func validateAndCompileSpecPatchNode(env *cel.Env, inspector *ast.Inspector, node *Node) error {
+func validateAndCompileSpecPatchNode(sessionCache *celcache.SessionCache, env *cel.Env, inspector *ast.Inspector, node *Node) error {
 	// Compile includeWhen expressions (may reference schema.* and any ready dependency).
-	if err := validateAndCompileIncludeWhen(env, node); err != nil {
+	if err := validateAndCompileIncludeWhen(sessionCache, env, node); err != nil {
 		return err
 	}
 
@@ -1479,7 +1479,7 @@ func validateAndCompileSpecPatchNode(env *cel.Env, inspector *ast.Inspector, nod
 			expr.References = append(expr.References, dep.ID)
 		}
 		// Parse and compile the expression.
-		if _, err := parseCheckAndCompile(env, expr); err != nil {
+		if _, err := parseCheckAndCompile(sessionCache, env, expr); err != nil {
 			return fmt.Errorf("specPatch node %q field %q: %w", node.Meta.ID, fieldName, err)
 		}
 		compiled[fieldName] = expr
