@@ -167,7 +167,7 @@ type ForEachDimension map[string]string
 // Each resource can either be created using a template or reference an existing resource.
 // Resources can depend on each other through CEL expressions, creating a dependency graph.
 //
-// +kubebuilder:validation:XValidation:rule="(has(self.template) && !has(self.externalRef)) || (!has(self.template) && has(self.externalRef))",message="exactly one of template or externalRef must be provided"
+// +kubebuilder:validation:XValidation:rule="(has(self.template) && !has(self.externalRef)) || (!has(self.template) && has(self.externalRef)) || (has(self.type) && (self.type == 'specPatch' || self.type == 'stateWrite') && !has(self.template) && !has(self.externalRef))",message="exactly one of template or externalRef must be provided, or type must be specPatch or stateWrite"
 type Resource struct {
 	// ID is a unique identifier for this resource within the ResourceGraphDefinition.
 	// It is used to reference this resource in CEL expressions from other resources.
@@ -175,15 +175,40 @@ type Resource struct {
 	//
 	// +kubebuilder:validation:Required
 	ID string `json:"id,omitempty"`
+	// Type is an optional discriminator for virtual resource nodes.
+	// Supported values:
+	//   - "specPatch": evaluates CEL expressions and patches fields back into the instance's spec
+	//     via SSA. No Kubernetes resource is created.
+	//   - "stateWrite": evaluates CEL expressions and writes results to status.kstate.* on the
+	//     instance via the /status subresource. No Kubernetes resource is created.
+	// When omitted, the node behaves as a standard resource node (template or externalRef required).
+	//
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=specPatch;stateWrite
+	Type string `json:"type,omitempty"`
+	// Patch is the map of spec field names to CEL expressions for specPatch nodes.
+	// Each key must be a field that exists in schema.spec; the value is a CEL
+	// expression evaluated against schema and any ready child resource statuses.
+	// Only valid when type is "specPatch".
+	//
+	// +kubebuilder:validation:Optional
+	Patch map[string]string `json:"patch,omitempty"`
+	// State is the map of status.kstate field names to CEL expressions for stateWrite nodes.
+	// Each key becomes a field under status.kstate.*; the value is a CEL expression
+	// evaluated against schema and any ready child resource statuses.
+	// Only valid when type is "stateWrite".
+	//
+	// +kubebuilder:validation:Optional
+	State map[string]string `json:"state,omitempty"`
 	// Template is the Kubernetes resource manifest to create.
 	// It can contain CEL expressions (using ${...} syntax) that reference other resources.
-	// Exactly one of template or externalRef must be provided.
+	// Exactly one of template or externalRef must be provided (unless type is specPatch or stateWrite).
 	//
 	// +kubebuilder:validation:Optional
 	Template runtime.RawExtension `json:"template,omitempty"`
 	// ExternalRef references an existing resource in the cluster instead of creating one.
 	// This is useful for reading existing resources and using their values in other resources.
-	// Exactly one of template or externalRef must be provided.
+	// Exactly one of template or externalRef must be provided (unless type is specPatch or stateWrite).
 	//
 	// +kubebuilder:validation:Optional
 	ExternalRef *ExternalRef `json:"externalRef,omitempty"`

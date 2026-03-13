@@ -34,6 +34,11 @@ type Interface interface {
 
 	// Instance returns the instance node.
 	Instance() *Node
+
+	// RefreshInstance updates the instance node's observed state.
+	// Call after a specPatch mutates the instance CR so subsequent
+	// nodes in the same reconcile cycle see the latest spec values.
+	RefreshInstance(updated *unstructured.Unstructured)
 }
 
 // Runtime is the execution context for a single reconciliation.
@@ -178,4 +183,11 @@ func (r *Runtime) Nodes() []*Node {
 // Instance returns the instance node.
 func (r *Runtime) Instance() *Node {
 	return r.instance
+}
+
+// RefreshInstance updates the instance node's observed state. Call this after
+// a specPatch mutates the instance CR so that subsequent nodes in the same
+// reconcile cycle see the latest spec values.
+func (r *Runtime) RefreshInstance(updated *unstructured.Unstructured) {
+	r.instance.SetObserved([]*unstructured.Unstructured{updated})
 }

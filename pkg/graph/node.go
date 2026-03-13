@@ -59,6 +59,15 @@ const (
 	// NodeTypeExternalCollection is an external reference with a label selector
 	// that matches multiple resources (read-only collection, not applied).
 	NodeTypeExternalCollection
+	// NodeTypeSpecPatch is a virtual node that evaluates CEL expressions and
+	// patches fields back into the parent instance CR's spec via SSA.
+	// It does not create any Kubernetes resource. (Alt A: cel-writeback)
+	NodeTypeSpecPatch
+	// NodeTypeStateWrite is a virtual node that evaluates CEL expressions and
+	// writes the results to status.kstate.* on the parent instance CR via the
+	// /status subresource. It does not create any Kubernetes resource.
+	// (Alt B: cel-writeback)
+	NodeTypeStateWrite
 )
 
 // String returns a human-readable string for the node type.
@@ -74,6 +83,10 @@ func (t NodeType) String() string {
 		return "Instance"
 	case NodeTypeExternalCollection:
 		return "ExternalCollection"
+	case NodeTypeSpecPatch:
+		return "SpecPatch"
+	case NodeTypeStateWrite:
+		return "StateWrite"
 	default:
 		return "Unknown"
 	}
@@ -132,6 +145,24 @@ type Node struct {
 	// ForEach holds the forEach dimensions for collection resources.
 	// nil or empty means this is not a collection.
 	ForEach []ForEachDimension
+
+	// SpecPatch holds the field-name → raw CEL expression mapping for
+	// NodeTypeSpecPatch nodes. The runtime evaluates these and patches the
+	// parent instance CR's spec using SSA.
+	SpecPatch map[string]string
+
+	// CompiledSpecPatch holds the field-name → compiled krocel.Expression for
+	// NodeTypeSpecPatch nodes. Populated by the builder during compilation.
+	CompiledSpecPatch map[string]*krocel.Expression
+
+	// StateWrite holds the field-name → raw CEL expression mapping for
+	// NodeTypeStateWrite nodes. The runtime evaluates these and patches
+	// status.kstate.* on the parent instance CR via the /status subresource.
+	StateWrite map[string]string
+
+	// CompiledStateWrite holds the field-name → compiled krocel.Expression for
+	// NodeTypeStateWrite nodes. Populated by the builder during compilation.
+	CompiledStateWrite map[string]*krocel.Expression
 }
 
 // DeepCopy creates a deep copy of the Node.
@@ -153,6 +184,34 @@ func (n *Node) DeepCopy() *Node {
 		IncludeWhen: slices.Clone(n.IncludeWhen),
 		ReadyWhen:   slices.Clone(n.ReadyWhen),
 		ForEach:     slices.Clone(n.ForEach),
+	}
+
+	if n.SpecPatch != nil {
+		cp.SpecPatch = make(map[string]string, len(n.SpecPatch))
+		for k, v := range n.SpecPatch {
+			cp.SpecPatch[k] = v
+		}
+	}
+
+	if n.CompiledSpecPatch != nil {
+		cp.CompiledSpecPatch = make(map[string]*krocel.Expression, len(n.CompiledSpecPatch))
+		for k, v := range n.CompiledSpecPatch {
+			cp.CompiledSpecPatch[k] = v
+		}
+	}
+
+	if n.StateWrite != nil {
+		cp.StateWrite = make(map[string]string, len(n.StateWrite))
+		for k, v := range n.StateWrite {
+			cp.StateWrite[k] = v
+		}
+	}
+
+	if n.CompiledStateWrite != nil {
+		cp.CompiledStateWrite = make(map[string]*krocel.Expression, len(n.CompiledStateWrite))
+		for k, v := range n.CompiledStateWrite {
+			cp.CompiledStateWrite[k] = v
+		}
 	}
 
 	if n.Template != nil {

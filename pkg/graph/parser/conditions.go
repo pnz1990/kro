@@ -42,3 +42,18 @@ func ParseConditionExpressions(conditions []string) ([]*krocel.Expression, error
 
 	return expressions, nil
 }
+
+// StripExpressionWrapper strips the ${...} wrapper from a standalone CEL expression.
+// Returns an error if the value is not a valid standalone expression.
+func StripExpressionWrapper(s string) (string, error) {
+	ok, err := isStandaloneExpression(s)
+	if err != nil {
+		return "", fmt.Errorf("invalid CEL expression %q: %w", s, err)
+	}
+	if !ok {
+		return "", fmt.Errorf("CEL expression %q must be a standalone ${...} expression", s)
+	}
+	stripped := strings.TrimPrefix(s, "${")
+	stripped = strings.TrimSuffix(stripped, "}")
+	return stripped, nil
+}

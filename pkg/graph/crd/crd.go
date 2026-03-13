@@ -138,3 +138,25 @@ func SetCRDStatus(crd *extv1.CustomResourceDefinition, status extv1.JSONSchemaPr
 		crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["status"] = status
 	}
 }
+
+// InjectKstateField adds status.kstate (with x-kubernetes-preserve-unknown-fields)
+// to the CRD schema. Called when the RGD contains stateWrite nodes so that the
+// API server accepts kstate patches without "unknown field" warnings.
+func InjectKstateField(crd *extv1.CustomResourceDefinition) {
+	if len(crd.Spec.Versions) == 0 || crd.Spec.Versions[0].Schema == nil {
+		return
+	}
+	statusProps, ok := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["status"]
+	if !ok {
+		return
+	}
+	if statusProps.Properties == nil {
+		statusProps.Properties = make(map[string]extv1.JSONSchemaProps)
+	}
+	preserve := true
+	statusProps.Properties["kstate"] = extv1.JSONSchemaProps{
+		Type:                   "object",
+		XPreserveUnknownFields: &preserve,
+	}
+	crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["status"] = statusProps
+}

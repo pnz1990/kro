@@ -119,6 +119,7 @@ func BaseDeclarations() []cel.EnvOption {
 			library.Maps(),
 			library.JSON(),
 			library.Lists(),
+			library.CSV(),
 		}
 	})
 	return cachedBaseDeclarations

@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	apimachineryruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/kubernetes-sigs/kro/api/v1alpha1"
 	"github.com/kubernetes-sigs/kro/pkg/controller/instance/applyset"
@@ -148,6 +149,11 @@ func (c *Controller) reconcileNodes(rcx *ReconcileContext) error {
 	}
 	if clusterMutated {
 		return rcx.delayedRequeue(fmt.Errorf("cluster mutated"))
+	}
+	// stateWrite patched status.kstate — requeue so the next reconcile sees the
+	// updated kstate values and can evaluate the next increment step.
+	if rcx.StateWriteMutated {
+		return rcx.delayedRequeue(fmt.Errorf("kstate mutated"))
 	}
 
 	return nil
@@ -291,6 +297,16 @@ func (c *Controller) processNode(
 			return nil, err
 		}
 		return resources, nil
+	case graph.NodeTypeSpecPatch:
+		if err := c.processSpecPatchNode(rcx, node, state); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	case graph.NodeTypeStateWrite:
+		if err := c.processStateWriteNode(rcx, node, state); err != nil {
+			return nil, err
+		}
+		return nil, nil
 	case graph.NodeTypeInstance:
 		panic("instance node should not be processed for apply")
 	default:
@@ -540,6 +556,175 @@ func (c *Controller) patchInstanceWithApplySetMetadata(rcx *ReconcileContext, me
 	return err
 }
 
+// processSpecPatchNode evaluates CEL patch expressions and SSA-patches the parent
+// instance CR's spec. This implements Alternative A of the CEL write-back proposal.
+//
+// Flow:
+//  1. Evaluate all patch expressions via EvaluateSpecPatch().
+//  2. Compare computed values against current instance spec fields.
+//  3. If any value differs, issue an SSA patch to the instance CR using field
+//     manager "kro.run/specpatch". The patch is idempotent: no patch is issued
+//     if computed values already match the current spec.
+func (c *Controller) processSpecPatchNode(
+	rcx *ReconcileContext,
+	node *runtime.Node,
+	state *NodeState,
+) error {
+	id := node.Spec.Meta.ID
+
+	computed, err := node.EvaluateSpecPatch()
+	if err != nil {
+		if runtime.IsDataPending(err) {
+			state.SetWaitingForReadiness(fmt.Errorf("specPatch %q: data pending: %w", id, err))
+			return nil
+		}
+		state.SetError(fmt.Errorf("specPatch %q: eval failed: %w", id, err))
+		return state.Err
+	}
+
+	// Idempotency check: compare computed values against current spec.
+	currentSpec, _, _ := unstructured.NestedMap(rcx.Instance.Object, "spec")
+	needsPatch := false
+	for fieldName, computedVal := range computed {
+		currentVal, exists := currentSpec[fieldName]
+		if !exists || fmt.Sprintf("%v", currentVal) != fmt.Sprintf("%v", computedVal) {
+			needsPatch = true
+			break
+		}
+	}
+
+	if !needsPatch {
+		state.SetReady()
+		return nil
+	}
+
+	// Build the SSA patch object.
+	specPatch := make(map[string]interface{}, len(computed))
+	for k, v := range computed {
+		specPatch[k] = v
+	}
+	patchObj := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": rcx.Instance.GetAPIVersion(),
+			"kind":       rcx.Instance.GetKind(),
+			"metadata": map[string]interface{}{
+				"name":      rcx.Instance.GetName(),
+				"namespace": rcx.Instance.GetNamespace(),
+			},
+			"spec": specPatch,
+		},
+	}
+
+	// Use a per-node field manager so that different specPatch nodes do not
+	// drop each other's field ownership. With a shared field manager, when
+	// nodeA fires and writes fields {X, Y} and nodeB later fires and writes
+	// fields {Y, Z}, nodeA's ownership of field X is dropped — which causes
+	// the API server to revert X to its schema default. Using distinct
+	// managers ("kro.run/specpatch-<id>") isolates each node's ownership.
+	updated, err := rcx.InstanceClient().Apply(
+		rcx.Ctx,
+		rcx.Instance.GetName(),
+		patchObj,
+		metav1.ApplyOptions{
+			FieldManager: "kro.run/specpatch-" + id,
+			Force:        true,
+		},
+	)
+	if err != nil {
+		state.SetError(fmt.Errorf("specPatch %q: SSA patch failed: %w", id, err))
+		return state.Err
+	}
+
+	// Refresh the in-memory instance so subsequent specPatch nodes in the
+	// same reconcile cycle read the latest spec values. Without this,
+	// multiple specPatch nodes that write to the same field would race —
+	// each would read the pre-patch base state instead of the cumulative
+	// result.
+	rcx.Instance = updated
+	rcx.Runtime.RefreshInstance(updated)
+
+	rcx.Log.V(1).Info("specPatch applied", "id", id, "fields", len(computed))
+	state.SetReady()
+	return nil
+}
+
+// processStateWriteNode evaluates CEL state expressions and patches status.kstate.*
+// on the parent instance CR via the /status subresource.
+// This implements Alternative B of the CEL write-back proposal.
+//
+// Flow:
+//  1. Evaluate all state expressions via EvaluateStateWrite().
+//  2. Compare computed values against current status.kstate.* fields.
+//  3. If any value differs, issue an UpdateStatus call that merges the new
+//     values into status.kstate while preserving all other status fields.
+func (c *Controller) processStateWriteNode(
+	rcx *ReconcileContext,
+	node *runtime.Node,
+	state *NodeState,
+) error {
+	id := node.Spec.Meta.ID
+
+	computed, err := node.EvaluateStateWrite()
+	if err != nil {
+		if runtime.IsDataPending(err) {
+			state.SetWaitingForReadiness(fmt.Errorf("stateWrite %q: data pending: %w", id, err))
+			return nil
+		}
+		state.SetError(fmt.Errorf("stateWrite %q: eval failed: %w", id, err))
+		return state.Err
+	}
+
+	// Idempotency check: compare computed values against current status.kstate.
+	currentKstate, _, _ := unstructured.NestedMap(rcx.Instance.Object, "status", "kstate")
+	if currentKstate == nil {
+		currentKstate = map[string]interface{}{}
+	}
+	needsPatch := false
+	for fieldName, computedVal := range computed {
+		currentVal, exists := currentKstate[fieldName]
+		if !exists || fmt.Sprintf("%v", currentVal) != fmt.Sprintf("%v", computedVal) {
+			needsPatch = true
+			break
+		}
+	}
+
+	if !needsPatch {
+		state.SetReady()
+		return nil
+	}
+
+	// Build new kstate: start from current kstate, merge computed values.
+	newKstate := make(map[string]interface{}, len(currentKstate)+len(computed))
+	for k, v := range currentKstate {
+		newKstate[k] = v
+	}
+	for k, v := range computed {
+		newKstate[k] = v
+	}
+
+	// Use retry-on-conflict to safely update status.
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		cur, err := rcx.InstanceClient().Get(rcx.Ctx, rcx.Instance.GetName(), metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if err := unstructured.SetNestedMap(cur.Object, newKstate, "status", "kstate"); err != nil {
+			return fmt.Errorf("failed to set status.kstate: %w", err)
+		}
+		_, err = rcx.InstanceClient().UpdateStatus(rcx.Ctx, cur, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil {
+		state.SetError(fmt.Errorf("stateWrite %q: UpdateStatus failed: %w", id, err))
+		return state.Err
+	}
+
+	rcx.Log.V(1).Info("stateWrite applied", "id", id, "fields", len(computed))
+	rcx.StateWriteMutated = true
+	state.SetReady()
+	return nil
+}
+
 // processExternalRefNode reads an external ref object and updates node state.
 func (c *Controller) processExternalRefNode(
 	rcx *ReconcileContext,
@@ -643,6 +828,9 @@ func (c *Controller) processApplyResults(
 			}
 		case graph.NodeTypeExternal, graph.NodeTypeExternalCollection:
 			// External refs/collections handled before applyset.
+			continue
+		case graph.NodeTypeSpecPatch, graph.NodeTypeStateWrite:
+			// Virtual nodes are handled in processNode before the apply phase.
 			continue
 		case graph.NodeTypeInstance:
 			panic("instance node should not be in apply results")

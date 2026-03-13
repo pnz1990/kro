@@ -48,6 +48,12 @@ type ReconcileContext struct {
 	// Watcher is the per-instance watch handle from the coordinator.
 	// Use dynamiccontroller.NoopInstanceWatcher{} in tests.
 	Watcher dynamiccontroller.InstanceWatcher
+
+	// StateWriteMutated is set to true when a stateWrite node patched status.kstate
+	// during this reconcile pass. The reconcileNodes loop uses this to trigger a
+	// delayedRequeue so the next reconcile sees the updated kstate and can re-evaluate
+	// downstream nodes (e.g., the next increment step in a counter).
+	StateWriteMutated bool
 }
 
 // NewReconcileContext constructs a ReconcileContext for a single reconciliation cycle.
