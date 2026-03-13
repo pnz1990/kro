@@ -316,45 +316,58 @@ Two functions are provided:
 
 ### What it does
 
-Provides functional list mutation for `list(int)` values. CEL's built-in list
-operations are read-only; there is no way to return a new list with a single
-element changed. This library fills that gap.
+Provides index-mutation functions for lists. CEL's built-in list operations are
+all read-only — there is no way to return a new list with a single element
+replaced, inserted, or removed at a specific index. All functions are pure:
+they return a new list and do not modify the input.
 
 | Function | Signature | Description |
 |---|---|---|
-| `lists.set` | `(arr list(int), index int, value int) → list(int)` | Returns a new list with `arr[index]` replaced by `value` |
+| `lists.set` | `(arr list(int), index int, value int) → list(int)` | Legacy. Returns a new list with `arr[index]` replaced by `value`. Typed `list(int)` only — kept for backwards compatibility with existing RGDs. New code should use `lists.setIndex`. |
+| `lists.setIndex` | `(arr list(dyn), index int, value dyn) → list(dyn)` | Returns a new list with the element at `index` replaced by `value`. Works on any element type. |
+| `lists.insertAt` | `(arr list(dyn), index int, value dyn) → list(dyn)` | Returns a new list with `value` inserted before `index`. `index == size(arr)` appends. |
+| `lists.removeAt` | `(arr list(dyn), index int) → list(dyn)` | Returns a new list with the element at `index` removed. |
 
 ### Real-world use cases
 
-- **Per-replica configuration**: A `ShardedCache` CR has a `shardSizes []int`
-  field. When a shard grows beyond its threshold, a specPatch node calls
-  `lists.set(schema.spec.shardSizes, idx, newSize)` to update only that shard's
-  allocation.
+- **Per-replica HP tracking**: An array of monster HP values is updated on each
+  attack by calling `lists.setIndex(schema.spec.monsterHP, idx, newHP)`.
+- **Ordered task queue**: A `Pipeline` CR dequeues the front element on
+  completion with `lists.removeAt(schema.spec.pending, 0)` and enqueues new
+  work with `lists.insertAt(schema.spec.pending, size(...), newTask)`.
 - **Slot-based resource tracking**: A `NodePool` CR tracks available slots as
-  an integer array indexed by zone. When a slot is consumed, `lists.set`
-  decrements the appropriate zone's count without rebuilding the entire array.
-- **Multi-target batch operation**: A `BackupPlan` CR has a `lastBackupStatus []int`
-  (0=pending, 1=running, 2=complete). A specPatch node flips one entry per
-  reconcile cycle as each backup target completes.
+  an integer array indexed by zone. `lists.setIndex` updates a single zone's
+  count without rebuilding the entire array.
 
 ### YAML syntax
 
 ```yaml
-# Decrement slot count for zone 2
-- id: consumeSlot
+# Replace monster HP at a specific index
+- id: applyDamage
+  type: specPatch
+  patch:
+    monsterHP: "${lists.setIndex(schema.spec.monsterHP, idx, newHP)}"
+
+# Remove the first pending task when it completes
+- id: dequeue
   type: specPatch
   includeWhen:
-    - "${schema.spec.zoneSlots[2] > 0}"
+    - "${size(schema.spec.pending) > 0}"
   patch:
-    zoneSlots: "${lists.set(schema.spec.zoneSlots, 2, schema.spec.zoneSlots[2] - 1)}"
+    pending: "${lists.removeAt(schema.spec.pending, 0)}"
 ```
 
 ### Implementation notes
 
 - Located in: `pkg/cel/library/lists.go`
-- Currently typed only for `list(int)` — index and value must also be `int`
-- Bounds-checks `index` and returns an error for out-of-range access
-- Returns a new `[]int64` slice; does not mutate the input
+- `lists.setIndex`, `lists.insertAt`, `lists.removeAt` use `list(dyn)` — any
+  element type is accepted; index must be `int`
+- `lists.setIndex` and `lists.removeAt` require index in `[0, size(arr))`; out-of-range returns an error
+- `lists.insertAt` accepts index in `[0, size(arr)]`; `index == size(arr)` is a valid append
+- New lists are built with `types.NewRefValList` — values are not copied through
+  native Go slices, so mixed-type lists round-trip correctly
+- `lists.set` (legacy) is kept as-is: typed `list(int)`, builds `[]int64` via
+  `NativeToValue`, unchanged behaviour for existing callers
 - Registered in the base CEL environment via `library.Lists()`
 
 ---
@@ -431,7 +444,7 @@ addition to the libraries that were already present:
 |---|---|
 | `ext.Bindings()` | `cel.bind(var, init, body)` let-binding syntax |
 | `library.Random()` | `random.seededString`, `random.seededInt` |
-| `library.Lists()` | `lists.set` |
+| `library.Lists()` | `lists.set` (legacy), `lists.setIndex`, `lists.insertAt`, `lists.removeAt` |
 | `library.CSV()` | `csv.remove`, `csv.add`, `csv.contains` |
 
 The base environment is computed once via `sync.Once` and cached. All
@@ -552,8 +565,8 @@ spec:
 | `pkg/cel/ast/inspector_test.go` | Modified | Two new `cel.bind` test cases |
 | `pkg/cel/library/random.go` | New | `random.seededString`, `random.seededInt` |
 | `pkg/cel/library/random_test.go` | New | Tests for random library |
-| `pkg/cel/library/lists.go` | New | `lists.set` |
-| `pkg/cel/library/lists_test.go` | New | Tests for lists library |
+| `pkg/cel/library/lists.go` | Modified | Added `lists.setIndex`, `lists.insertAt`, `lists.removeAt` (dyn); `lists.set` kept as legacy |
+| `pkg/cel/library/lists_test.go` | Modified | Tests for all four list functions including composition cases |
 | `pkg/cel/library/csv.go` | New | `csv.remove`, `csv.add`, `csv.contains` |
 | `pkg/cel/library/csv_test.go` | New | Tests for csv library |
 | `helm/crds/kro.run_resourcegraphdefinitions.yaml` | Modified | Updated CRD schema to include `type`, `patch`, `state` fields on `spec.resources.items` |
