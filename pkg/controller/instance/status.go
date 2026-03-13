@@ -146,13 +146,24 @@ func (c *Controller) updateStatus(rcx *ReconcileContext) error {
 	if err != nil {
 		return err
 	}
-	if resolved, found, _ := unstructured.NestedMap(desired[0].Object, "status"); found {
-		for k, v := range resolved {
-			if k == "conditions" || k == "state" {
-				continue
+	// Use NestedFieldNoCopy to avoid DeepCopyJSONValue which panics on []byte values
+	// (e.g. from Secret.data fields accessed in CEL expressions). We then manually
+	// convert any []byte values to base64 strings so they are JSON-safe.
+	if rawStatus, found, _ := unstructured.NestedFieldNoCopy(desired[0].Object, "status"); found {
+		if resolved, ok := rawStatus.(map[string]interface{}); ok {
+			for k, v := range resolved {
+				if k == "conditions" || k == "state" {
+					continue
+				}
+				status[k] = sanitizeForJSON(v)
 			}
-			status[k] = v
 		}
+	}
+
+	// Preserve status.kstate written by stateWrite nodes.
+	// updateStatus builds a fresh status map that would otherwise wipe kstate.
+	if kstate, found, _ := unstructured.NestedMap(rcx.Instance.Object, "status", "kstate"); found {
+		status["kstate"] = kstate
 	}
 
 	inst := rcx.Instance.DeepCopy()
@@ -165,6 +176,10 @@ func (c *Controller) updateStatus(rcx *ReconcileContext) error {
 			Get(rcx.Ctx, inst.GetName(), metav1.GetOptions{})
 		if err != nil {
 			return err
+		}
+		// Also preserve kstate from the freshly-fetched version (may be newer than rcx.Instance).
+		if kstate, found, _ := unstructured.NestedMap(cur.Object, "status", "kstate"); found {
+			status["kstate"] = kstate
 		}
 		cur.Object["status"] = status
 		_, err = c.client.Dynamic().
@@ -224,5 +239,30 @@ func (rcx *ReconcileContext) updateInstanceState() {
 		return
 	default:
 		rcx.StateManager.Update()
+	}
+}
+
+// sanitizeForJSON recursively converts values that cannot be deep-copied by
+// k8s.io/apimachinery's DeepCopyJSONValue (e.g. []byte from Secret.data) into
+// JSON-safe types. []byte is base64-encoded and returned as a string, which
+// matches Kubernetes' own JSON serialization of binary secret data.
+func sanitizeForJSON(v interface{}) interface{} {
+	switch val := v.(type) {
+	case []byte:
+		return string(val)
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(val))
+		for k, vv := range val {
+			out[k] = sanitizeForJSON(vv)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(val))
+		for i, vv := range val {
+			out[i] = sanitizeForJSON(vv)
+		}
+		return out
+	default:
+		return v
 	}
 }

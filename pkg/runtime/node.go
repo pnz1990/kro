@@ -92,8 +92,15 @@ func (n *Node) IsIgnored() (bool, error) {
 		return false, nil
 	}
 
-	// includeWhen only allows schema references; restrict context to schema.
-	ctx := n.buildContext(graph.InstanceNodeID)
+	// For stateWrite nodes, includeWhen may reference schema.status.state.*;
+	// use the state-inclusive context. For all other nodes, restrict to schema only.
+	var ctx map[string]any
+	if n.Spec.Meta.Type == graph.NodeTypeStateWrite {
+		ctx = n.buildContextWithState()
+	} else {
+		// includeWhen only allows schema references; restrict context to schema.
+		ctx = n.buildContext(graph.InstanceNodeID)
+	}
 
 	for _, expr := range n.includeWhenExprs {
 		val, err := evalBoolExpr(expr, ctx)
@@ -164,6 +171,14 @@ func (n *Node) GetDesired() (result []*unstructured.Unstructured, err error) {
 		// metadata (name, namespace, selector). The caller extracts
 		// the resolved selector for LIST operations.
 		result, err = n.hardResolveSingleResource(n.templateVars)
+	case graph.NodeTypeSpecPatch:
+		// specPatch nodes produce no Kubernetes resource; the controller calls
+		// EvaluateSpecPatch() separately. Return nil, nil to skip apply.
+		return nil, nil
+	case graph.NodeTypeStateWrite:
+		// stateWrite nodes produce no Kubernetes resource; the controller calls
+		// EvaluateStateWrite() separately. Return nil, nil to skip apply.
+		return nil, nil
 	default:
 		panic(fmt.Sprintf("unknown node type: %v", n.Spec.Meta.Type))
 	}
@@ -220,11 +235,40 @@ func (n *Node) GetDesiredIdentity() (result []*unstructured.Unstructured, err er
 	case graph.NodeTypeExternalCollection:
 		// External collections have no identity to resolve; they use selectors.
 		return nil, nil
+	case graph.NodeTypeSpecPatch:
+		// specPatch nodes have no Kubernetes identity.
+		return nil, nil
+	case graph.NodeTypeStateWrite:
+		// stateWrite nodes have no Kubernetes identity.
+		return nil, nil
+		return nil, nil
 	case graph.NodeTypeInstance:
 		panic("GetDesiredIdentity called for instance node")
 	default:
 		panic(fmt.Sprintf("unknown node type: %v", n.Spec.Meta.Type))
 	}
+}
+
+// EvaluateSpecPatch evaluates all patch expressions in a NodeTypeSpecPatch node
+// and returns a map of field-name → computed value. The caller is responsible
+// for diffing against current spec and issuing a patch if needed.
+func (n *Node) EvaluateSpecPatch() (map[string]any, error) {
+	if n.Spec.Meta.Type != graph.NodeTypeSpecPatch {
+		panic(fmt.Sprintf("EvaluateSpecPatch called on node type %v", n.Spec.Meta.Type))
+	}
+	ctx := n.buildContext() // all deps
+	result := make(map[string]any, len(n.Spec.CompiledSpecPatch))
+	for fieldName, expr := range n.Spec.CompiledSpecPatch {
+		val, err := expr.Eval(ctx)
+		if err != nil {
+			if isCELDataPending(err) {
+				return nil, fmt.Errorf("specPatch field %q: %w", fieldName, ErrDataPending)
+			}
+			return nil, fmt.Errorf("specPatch field %q: %w", fieldName, err)
+		}
+		result[fieldName] = val
+	}
+	return result, nil
 }
 
 func normalizeNamespaces(objs []*unstructured.Unstructured, namespace string) {
@@ -258,11 +302,76 @@ func (n *Node) DeleteTargets() ([]*unstructured.Unstructured, error) {
 			return orderedIntersection(n.observed, desired), nil
 		}
 		return n.observed, nil
+	case graph.NodeTypeStateWrite:
+		// stateWrite nodes create no resources; nothing to delete.
+		return nil, nil
 	case graph.NodeTypeInstance, graph.NodeTypeExternal, graph.NodeTypeExternalCollection:
 		panic(fmt.Sprintf("DeleteTargets called for node type %v", n.Spec.Meta.Type))
+	case graph.NodeTypeSpecPatch:
+		// specPatch nodes create no resources; nothing to delete.
+		return nil, nil
 	default:
 		panic(fmt.Sprintf("unknown node type: %v", n.Spec.Meta.Type))
 	}
+}
+
+// EvaluateStateWrite evaluates all state expressions in a NodeTypeStateWrite node
+// and returns a map of field-name → computed value. The caller patches
+// status.state.* on the parent instance CR via the /status subresource.
+func (n *Node) EvaluateStateWrite() (map[string]any, error) {
+	if n.Spec.Meta.Type != graph.NodeTypeStateWrite {
+		panic(fmt.Sprintf("EvaluateStateWrite called on node type %v", n.Spec.Meta.Type))
+	}
+	// Build context including status.state so self-referencing expressions work
+	// (e.g. retryCount: has(schema.status.state.retryCount) ? ... + 1 : 1).
+	ctx := n.buildContextWithState()
+	result := make(map[string]any, len(n.Spec.CompiledStateWrite))
+	for fieldName, expr := range n.Spec.CompiledStateWrite {
+		val, err := expr.Eval(ctx)
+		if err != nil {
+			if isCELDataPending(err) {
+				return nil, fmt.Errorf("stateWrite field %q: %w", fieldName, ErrDataPending)
+			}
+			return nil, fmt.Errorf("stateWrite field %q: %w", fieldName, err)
+		}
+		result[fieldName] = val
+	}
+	return result, nil
+}
+
+// buildContextWithState is like buildContext but also injects status.kstate into
+// the "schema" variable so stateWrite expressions can read prior state values
+// via schema.status.kstate.*.
+func (n *Node) buildContextWithState() map[string]any {
+	ctx := n.buildContext()
+	// Replace the schema entry with a version that includes status.kstate.
+	instDep, ok := n.deps[graph.InstanceNodeID]
+	if !ok || len(instDep.observed) == 0 {
+		return ctx
+	}
+	obj := instDep.observed[0].Object
+
+	// Build a schema object that has spec + metadata + status.kstate only.
+	// Always include status.kstate (even if empty) so has() guards work on first reconcile.
+	withState := make(map[string]any, len(obj)+1)
+	for k, v := range obj {
+		if k == "status" {
+			continue // will be replaced below
+		}
+		withState[k] = v
+	}
+
+	// Extract status.kstate from the actual status map (may be nil on first reconcile).
+	kstate := map[string]any{}
+	if statusMap, ok := obj["status"].(map[string]any); ok {
+		if k, ok := statusMap["kstate"].(map[string]any); ok {
+			kstate = k
+		}
+	}
+	withState["status"] = map[string]any{"kstate": kstate}
+
+	ctx[graph.InstanceNodeID] = withState
+	return ctx
 }
 
 func (n *Node) hardResolveSingleResource(vars []*variable.ResourceField) ([]*unstructured.Unstructured, error) {

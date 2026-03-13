@@ -305,6 +305,15 @@ func (b *Builder) NewResourceGraphDefinition(originalCR *v1alpha1.ResourceGraphD
 	// Update the CRD with the inferred status schema.
 	crd.SetCRDStatus(instanceCRD, *statusSchema, true)
 
+	// If any stateWrite nodes are present, inject status.kstate into the CRD schema
+	// so the API server accepts kstate writes without "unknown field" warnings.
+	for _, node := range nodes {
+		if node.Meta.Type == NodeTypeStateWrite {
+			crd.InjectKstateField(instanceCRD)
+			break
+		}
+	}
+
 	// Create the instance node with status variables for runtime patching.
 	instance, err := buildInstanceNode(
 		rgd.Spec.Schema.Group,
@@ -359,6 +368,14 @@ func (b *Builder) buildRGResource(
 	rgResource *v1alpha1.Resource,
 	order int,
 ) (*Node, *spec.Schema, error) {
+	// Dispatch virtual node types (no K8s resource created).
+	if rgResource.Type == "specPatch" {
+		return b.buildSpecPatchNode(rgResource, order)
+	}
+	if rgResource.Type == "stateWrite" {
+		return b.buildStateWriteNode(rgResource, order)
+	}
+
 	// 1. Validate resource field combinations.
 	if err := validateCombinableResourceFields(rgResource); err != nil {
 		return nil, nil, fmt.Errorf("invalid combination of resource fields: %w", err)
@@ -489,6 +506,98 @@ func (b *Builder) buildRGResource(
 	return node, resourceSchema, nil
 }
 
+// buildSpecPatchNode constructs a NodeTypeSpecPatch node from a specPatch resource
+// definition. These nodes have no GVR/template — they store a map of field names
+// to raw CEL expression strings that the runtime evaluates and patches back into
+// the parent instance CR's spec.
+func (b *Builder) buildSpecPatchNode(
+	rgResource *v1alpha1.Resource,
+	order int,
+) (*Node, *spec.Schema, error) {
+	if len(rgResource.Patch) == 0 {
+		return nil, nil, fmt.Errorf("specPatch node %q must have at least one entry in patch", rgResource.ID)
+	}
+	if len(rgResource.ReadyWhen) > 0 {
+		return nil, nil, fmt.Errorf("specPatch node %q does not support readyWhen", rgResource.ID)
+	}
+	if len(rgResource.ForEach) > 0 {
+		return nil, nil, fmt.Errorf("specPatch node %q does not support forEach", rgResource.ID)
+	}
+
+	includeWhen, err := parser.ParseConditionExpressions(rgResource.IncludeWhen)
+	if err != nil {
+		return nil, nil, fmt.Errorf("specPatch node %q: failed to parse includeWhen: %w", rgResource.ID, err)
+	}
+
+	// Strip ${...} wrapper from patch values — users write "patch: {field: "${expr}"}"
+	// but expressions are stored without the wrapper (same convention as includeWhen).
+	strippedPatch := make(map[string]string, len(rgResource.Patch))
+	for fieldName, rawExpr := range rgResource.Patch {
+		stripped, err := parser.StripExpressionWrapper(rawExpr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("specPatch node %q field %q: %w", rgResource.ID, fieldName, err)
+		}
+		strippedPatch[fieldName] = stripped
+	}
+
+	node := &Node{
+		Meta: NodeMeta{
+			ID:    rgResource.ID,
+			Index: order,
+			Type:  NodeTypeSpecPatch,
+			// GVR and Namespaced are zero-value (not applicable).
+		},
+		SpecPatch:   strippedPatch,
+		IncludeWhen: includeWhen,
+	}
+	// Return nil schema — no Kubernetes resource type is associated.
+	return node, nil, nil
+}
+
+// buildStateWriteNode constructs a NodeTypeStateWrite node from a stateWrite resource
+// definition. These nodes have no GVR/template — they evaluate CEL expressions and
+// patch the results back to status.kstate.* on the parent instance CR.
+func (b *Builder) buildStateWriteNode(
+	rgResource *v1alpha1.Resource,
+	order int,
+) (*Node, *spec.Schema, error) {
+	if len(rgResource.State) == 0 {
+		return nil, nil, fmt.Errorf("stateWrite node %q must have at least one entry in state", rgResource.ID)
+	}
+	if len(rgResource.ReadyWhen) > 0 {
+		return nil, nil, fmt.Errorf("stateWrite node %q does not support readyWhen", rgResource.ID)
+	}
+	if len(rgResource.ForEach) > 0 {
+		return nil, nil, fmt.Errorf("stateWrite node %q does not support forEach", rgResource.ID)
+	}
+
+	includeWhen, err := parser.ParseConditionExpressions(rgResource.IncludeWhen)
+	if err != nil {
+		return nil, nil, fmt.Errorf("stateWrite node %q: failed to parse includeWhen: %w", rgResource.ID, err)
+	}
+
+	// Strip ${...} wrapper from state values.
+	strippedState := make(map[string]string, len(rgResource.State))
+	for fieldName, rawExpr := range rgResource.State {
+		stripped, err := parser.StripExpressionWrapper(rawExpr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("stateWrite node %q field %q: %w", rgResource.ID, fieldName, err)
+		}
+		strippedState[fieldName] = stripped
+	}
+
+	node := &Node{
+		Meta: NodeMeta{
+			ID:    rgResource.ID,
+			Index: order,
+			Type:  NodeTypeStateWrite,
+		},
+		StateWrite:  strippedState,
+		IncludeWhen: includeWhen,
+	}
+	return node, nil, nil
+}
+
 // buildDependencyGraph builds the dependency graph between the nodes in the
 // resource graph definition. The dependency graph is a directed acyclic graph
 // that represents the relationships between the nodes. The graph is used
@@ -509,6 +618,48 @@ func (b *Builder) buildDependencyGraph(
 
 	for _, node := range nodes {
 		iteratorNames := collectIteratorNames(node)
+
+		// Virtual nodes (specPatch, stateWrite) have no template Variables;
+		// extract deps from their raw CEL strings + includeWhen.
+		if node.Meta.Type == NodeTypeSpecPatch {
+			specPatchDeps, err := extractSpecPatchDependencies(inspector, node)
+			if err != nil {
+				return nil, err
+			}
+			node.Meta.Dependencies = append(node.Meta.Dependencies, specPatchDeps...)
+			if err := directedAcyclicGraph.AddDependencies(node.Meta.ID, specPatchDeps); err != nil {
+				return nil, err
+			}
+			// Also extract includeWhen deps
+			includeWhenDeps, _, err := extractIncludeWhenDependencies(inspector, node)
+			if err != nil {
+				return nil, err
+			}
+			node.Meta.Dependencies = append(node.Meta.Dependencies, includeWhenDeps...)
+			if err := directedAcyclicGraph.AddDependencies(node.Meta.ID, includeWhenDeps); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if node.Meta.Type == NodeTypeStateWrite {
+			stateWriteDeps, err := extractStateWriteDependencies(inspector, node)
+			if err != nil {
+				return nil, err
+			}
+			node.Meta.Dependencies = append(node.Meta.Dependencies, stateWriteDeps...)
+			if err := directedAcyclicGraph.AddDependencies(node.Meta.ID, stateWriteDeps); err != nil {
+				return nil, err
+			}
+			includeWhenDeps, _, err := extractIncludeWhenDependencies(inspector, node)
+			if err != nil {
+				return nil, err
+			}
+			node.Meta.Dependencies = append(node.Meta.Dependencies, includeWhenDeps...)
+			if err := directedAcyclicGraph.AddDependencies(node.Meta.ID, includeWhenDeps); err != nil {
+				return nil, err
+			}
+			continue
+		}
 
 		// Phase 1: Extract dependencies and classify variables
 		templateDeps, usedIterators, err := extractTemplateDependencies(inspector, node, iteratorNames)
@@ -646,6 +797,73 @@ func extractForEachDependencies(
 	}
 
 	return allDeps, nil
+}
+
+// extractSpecPatchDependencies extracts resource dependencies from the raw CEL
+// expressions in a specPatch node's Patch map.
+func extractSpecPatchDependencies(inspector *ast.Inspector, node *Node) ([]string, error) {
+	var allDeps []string
+	for fieldName, rawExpr := range node.SpecPatch {
+		result, err := inspector.Inspect(rawExpr)
+		if err != nil {
+			return nil, fmt.Errorf("specPatch node %q field %q: failed to inspect expression: %w", node.Meta.ID, fieldName, err)
+		}
+		for _, dep := range result.ResourceDependencies {
+			if dep.ID == SchemaVarName {
+				continue
+			}
+			if !slices.Contains(allDeps, dep.ID) {
+				allDeps = append(allDeps, dep.ID)
+			}
+		}
+		for _, unknown := range result.UnknownResources {
+			return nil, fmt.Errorf("specPatch node %q field %q: references unknown identifier %q", node.Meta.ID, fieldName, unknown.ID)
+		}
+	}
+	return allDeps, nil
+}
+
+// extractStateWriteDependencies extracts resource dependencies from the raw CEL
+// expressions in a stateWrite node's State map.
+func extractStateWriteDependencies(inspector *ast.Inspector, node *Node) ([]string, error) {
+	var allDeps []string
+	for fieldName, rawExpr := range node.StateWrite {
+		result, err := inspector.Inspect(rawExpr)
+		if err != nil {
+			return nil, fmt.Errorf("stateWrite node %q field %q: failed to inspect expression: %w", node.Meta.ID, fieldName, err)
+		}
+		for _, dep := range result.ResourceDependencies {
+			if dep.ID == SchemaVarName {
+				continue
+			}
+			if !slices.Contains(allDeps, dep.ID) {
+				allDeps = append(allDeps, dep.ID)
+			}
+		}
+		for _, unknown := range result.UnknownResources {
+			return nil, fmt.Errorf("stateWrite node %q field %q: references unknown identifier %q", node.Meta.ID, fieldName, unknown.ID)
+		}
+	}
+	return allDeps, nil
+}
+
+// extractIncludeWhenDependencies extracts resource dependencies from a node's
+// includeWhen expressions. Used for virtual nodes (specPatch, stateWrite) which
+// bypass the normal extractTemplateDependencies path.
+func extractIncludeWhenDependencies(inspector *ast.Inspector, node *Node) ([]string, []string, error) {
+	var allDeps []string
+	for _, expr := range node.IncludeWhen {
+		deps, _, err := extractDependencies(inspector, expr, nil)
+		if err != nil {
+			return nil, nil, fmt.Errorf("node %q includeWhen: %w", node.Meta.ID, err)
+		}
+		for _, dep := range deps {
+			if !slices.Contains(allDeps, dep) {
+				allDeps = append(allDeps, dep)
+			}
+		}
+	}
+	return allDeps, nil, nil
 }
 
 // buildInstanceNode creates the instance node from pre-computed status components.
@@ -1035,6 +1253,14 @@ func lookupSchemaAtField(schema *spec.Schema, field string) *spec.Schema {
 //
 // Uses the shared inspectorEnv for AST inspection and typed env for compilation.
 func validateAndCompileNode(builderCache *celcache.BuilderCache, sessionCache *celcache.SessionCache, node *Node, inspector *ast.Inspector, env *cel.Env, nodeSchema *spec.Schema, typeProvider *krocel.DeclTypeProvider) error {
+	// Virtual nodes have no template; compile their expressions separately.
+	if node.Meta.Type == NodeTypeSpecPatch {
+		return validateAndCompileSpecPatchNode(env, inspector, node)
+	}
+	if node.Meta.Type == NodeTypeStateWrite {
+		return validateAndCompileStateWriteNode(env, inspector, node)
+	}
+
 	// Track iterator types for extending template environment
 	var iteratorTypes map[string]*cel.Type
 
@@ -1230,6 +1456,99 @@ func validateAndCompileIncludeWhen(sessionCache *celcache.SessionCache, env *cel
 	return nil
 }
 
+// validateAndCompileSpecPatchNode compiles the Patch expressions and includeWhen
+// expressions for a NodeTypeSpecPatch node. The compiled programs are stored back
+// into node.IncludeWhen[i].Program. Patch expressions are compiled and stored in
+// node.CompiledSpecPatch.
+func validateAndCompileSpecPatchNode(env *cel.Env, inspector *ast.Inspector, node *Node) error {
+	// Compile includeWhen expressions (may reference schema.* and any ready dependency).
+	if err := validateAndCompileIncludeWhen(env, node); err != nil {
+		return err
+	}
+
+	// Compile patch expressions. Each value is a raw CEL string producing any type.
+	compiled := make(map[string]*krocel.Expression, len(node.SpecPatch))
+	for fieldName, rawExpr := range node.SpecPatch {
+		expr := krocel.NewUncompiled(rawExpr)
+		// Populate references from the inspector (needed for runtime context building).
+		result, err := inspector.Inspect(rawExpr)
+		if err != nil {
+			return fmt.Errorf("specPatch node %q field %q: %w", node.Meta.ID, fieldName, err)
+		}
+		for _, dep := range result.ResourceDependencies {
+			expr.References = append(expr.References, dep.ID)
+		}
+		// Parse and compile the expression.
+		if _, err := parseCheckAndCompile(env, expr); err != nil {
+			return fmt.Errorf("specPatch node %q field %q: %w", node.Meta.ID, fieldName, err)
+		}
+		compiled[fieldName] = expr
+	}
+	node.CompiledSpecPatch = compiled
+	return nil
+}
+
+// validateAndCompileStateWriteNode compiles the State expressions and includeWhen
+// expressions for a NodeTypeStateWrite node. Compiled programs are stored back
+// into node.CompiledStateWrite.
+//
+// State expressions may reference schema.status.state.* (to read prior state for
+// self-referencing counters). Because the typed CEL env uses schemaWithoutStatus,
+// those references would fail type-checking. We therefore use parse-only compilation
+// for stateWrite nodes — type safety is sacrificed for flexibility, and this is
+// documented as a known trade-off vs. Alt A.
+func validateAndCompileStateWriteNode(env *cel.Env, inspector *ast.Inspector, node *Node) error {
+	// Compile includeWhen using parse-only (no type check) to allow schema.status.state.* refs.
+	for _, expression := range node.IncludeWhen {
+		if err := parseOnlyCompile(env, expression, "includeWhen", node.Meta.ID); err != nil {
+			return err
+		}
+	}
+
+	// Compile state expressions (also parse-only for same reason).
+	compiled := make(map[string]*krocel.Expression, len(node.StateWrite))
+	for fieldName, rawExpr := range node.StateWrite {
+		expr := krocel.NewUncompiled(rawExpr)
+		result, err := inspector.Inspect(rawExpr)
+		if err != nil {
+			return fmt.Errorf("stateWrite node %q field %q: %w", node.Meta.ID, fieldName, err)
+		}
+		for _, dep := range result.ResourceDependencies {
+			expr.References = append(expr.References, dep.ID)
+		}
+		if err := parseOnlyCompileExpr(env, expr); err != nil {
+			return fmt.Errorf("stateWrite node %q field %q: %w", node.Meta.ID, fieldName, err)
+		}
+		compiled[fieldName] = expr
+	}
+	node.CompiledStateWrite = compiled
+	return nil
+}
+
+// parseOnlyCompile parses and compiles (but does NOT type-check) a condition expression.
+// Used for stateWrite nodes where expressions may reference schema.status.state.* which
+// is absent from the typed env.
+func parseOnlyCompile(env *cel.Env, expr *krocel.Expression, conditionType, resourceID string) error {
+	if err := parseOnlyCompileExpr(env, expr); err != nil {
+		return fmt.Errorf("failed to compile %s expression %q in resource %q: %w", conditionType, expr.Original, resourceID, err)
+	}
+	return nil
+}
+
+// parseOnlyCompileExpr parses and compiles without type-checking.
+func parseOnlyCompileExpr(env *cel.Env, expr *krocel.Expression) error {
+	parsedAST, issues := env.Parse(expr.Original)
+	if issues != nil && issues.Err() != nil {
+		return fmt.Errorf("parse: %w", issues.Err())
+	}
+	program, err := env.Program(parsedAST)
+	if err != nil {
+		return fmt.Errorf("compile: %w", err)
+	}
+	expr.Program = program
+	return nil
+}
+
 // validateAndCompileReadyWhen validates and compiles readyWhen expressions for a single node.
 func validateAndCompileReadyWhen(sessionCache *celcache.SessionCache, env *cel.Env, node *Node) error {
 	for _, expression := range node.ReadyWhen {
@@ -1312,12 +1631,15 @@ func getSchemaWithoutStatus(crd *extv1.CustomResourceDefinition) (*spec.Schema, 
 func collectNodeSchemas(nodes map[string]*Node, nodeSchemas map[string]*spec.Schema) map[string]*spec.Schema {
 	result := make(map[string]*spec.Schema)
 	for id, node := range nodes {
-		if sch, ok := nodeSchemas[id]; ok {
-			if node.Meta.Type == NodeTypeCollection || node.Meta.Type == NodeTypeExternalCollection {
-				result[id] = schema.WrapSchemaAsList(sch)
-			} else {
-				result[id] = sch
-			}
+		sch, ok := nodeSchemas[id]
+		if !ok || sch == nil {
+			// Virtual nodes (specPatch, stateWrite) have no schema — skip.
+			continue
+		}
+		if node.Meta.Type == NodeTypeCollection || node.Meta.Type == NodeTypeExternalCollection {
+			result[id] = schema.WrapSchemaAsList(sch)
+		} else {
+			result[id] = sch
 		}
 	}
 	return result
