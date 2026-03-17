@@ -359,64 +359,21 @@ element changed. This library fills that gap.
 
 ---
 
-## 8. `csv` CEL library
+## 8. `csv` CEL library — **REMOVED**
 
-### What it does
+This library (`pkg/cel/library/csv.go`) provided `csv.add`, `csv.remove`, and
+`csv.contains` for manipulating comma-separated value strings. It has been
+**removed** as of commit `4cb48f9`.
 
-Provides manipulation of **comma-separated value strings** — a common pattern
-for encoding simple ordered lists in a single Kubernetes string field when a
-full array field is impractical or when the field must remain a scalar type.
+The krombat game's inventory system (the sole consumer) has been migrated to
+use the upstream `json.marshal` / `json.unmarshal` CEL functions instead.
+Inventory is now stored as a JSON array string (e.g. `["weapon-common","armor-rare"]`)
+rather than a CSV string (e.g. `"weapon-common,armor-rare"`).
 
-Three functions are provided:
-
-| Function | Signature | Description |
-|---|---|---|
-| `csv.remove` | `(csv string, item string) → string` | Removes the first exact occurrence of `item`; returns original if not found |
-| `csv.add` | `(csv string, item string, cap int) → string` | Appends `item` if current element count is below `cap`; otherwise returns unchanged |
-| `csv.contains` | `(csv string, item string) → bool` | Returns `true` if `item` appears as an exact element in the CSV |
-
-### Real-world use cases
-
-- **Feature flag sets**: A `FeatureGate` CR stores enabled flags as a CSV string
-  `"dark-mode,beta-api,new-dashboard"`. `csv.add` and `csv.remove` toggle
-  individual flags. `csv.contains` gates downstream resource creation on flag
-  presence.
-- **Role membership tracking**: A `ClusterMember` CR tracks active role
-  assignments as a CSV string. A specPatch node appends a role on grant and
-  removes it on revoke, with a capacity limit enforced by `csv.add`.
-- **Ordered task queue (bounded)**: A `Pipeline` CR has a `pendingStages` CSV
-  field. A specPatch node uses `csv.remove` to dequeue the front element when
-  a stage completes, and `csv.add` to enqueue new stages up to a configured cap.
-
-### YAML syntax
-
-```yaml
-# Add a role to a member (max 10 roles)
-- id: grantRole
-  type: specPatch
-  includeWhen:
-    - "${schema.spec.pendingGrant != '' && !csv.contains(schema.spec.roles, schema.spec.pendingGrant)}"
-  patch:
-    roles:        "${csv.add(schema.spec.roles, schema.spec.pendingGrant, 10)}"
-    pendingGrant: "${''}"
-
-# Remove a role from a member
-- id: revokeRole
-  type: specPatch
-  includeWhen:
-    - "${schema.spec.pendingRevoke != ''}"
-  patch:
-    roles:         "${csv.remove(schema.spec.roles, schema.spec.pendingRevoke)}"
-    pendingRevoke: "${''}"
-```
-
-### Implementation notes
-
-- Located in: `pkg/cel/library/csv.go`
-- An empty string is treated as zero elements (not a single empty element)
-- `csv.remove` removes only the first occurrence
-- `csv.contains` is exact per-element match, not a substring search
-- Registered in the base CEL environment via `library.CSV()`
+This removal reduces the fork diff by 3 files:
+- `pkg/cel/library/csv.go` — deleted
+- `pkg/cel/library/csv_test.go` — deleted
+- `pkg/cel/environment.go` — one line `library.CSV()` removed
 
 ---
 
@@ -432,7 +389,6 @@ addition to the libraries that were already present:
 | `ext.Bindings()` | `cel.bind(var, init, body)` let-binding syntax |
 | `library.Random()` | `random.seededString`, `random.seededInt` |
 | `library.Lists()` | `lists.set` |
-| `library.CSV()` | `csv.remove`, `csv.add`, `csv.contains` |
 
 The base environment is computed once via `sync.Once` and cached. All
 per-expression environments extend the base via `base.Extend()`, so every CEL
