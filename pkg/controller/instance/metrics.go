@@ -25,6 +25,9 @@ func init() {
 		instanceReconcileDurationSeconds,
 		instanceReconcileTotal,
 		instanceReconcileErrorsTotal,
+		stateNodeWritesTotal,
+		stateNodeConflictsTotal,
+		stateNodeEvalErrorsTotal,
 	)
 }
 
@@ -60,5 +63,30 @@ var (
 			Help: "Total number of instance reconciliation errors per GVR",
 		},
 		[]string{"gvr"},
+	)
+
+	// State node metrics — per KREP-023 spec.
+	stateNodeWritesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "kro_state_node_writes_total",
+			Help: "Total number of successful state node status writes",
+		},
+		[]string{"node_id"},
+	)
+
+	stateNodeConflictsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "kro_state_node_conflicts_total",
+			Help: "Total number of state node UpdateStatus conflict retries",
+		},
+		[]string{"node_id"},
+	)
+
+	stateNodeEvalErrorsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "kro_state_node_evaluation_errors_total",
+			Help: "Total number of state node CEL expression evaluation errors",
+		},
+		[]string{"node_id"},
 	)
 )

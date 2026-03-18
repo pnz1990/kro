@@ -49,11 +49,21 @@ type Node struct {
 	templateExprs    []*expressionEvaluationState
 	templateVars     []*variable.ResourceField
 
+	// stateFieldExprs holds compiled expressions for state node fields.
+	// Only populated for NodeTypeState nodes.
+	stateFieldExprs []*stateFieldEvalState
+
 	rgdConfig graph.RGDConfig
 
 	// resourceSchema is the OpenAPI schema for this node's resource type.
 	// Used by buildContext to wrap observed resources with schema-aware CEL values.
 	resourceSchema *spec.Schema
+}
+
+// stateFieldEvalState pairs a state field name with its expression evaluation state.
+type stateFieldEvalState struct {
+	FieldName  string
+	Expression *expressionEvaluationState
 }
 
 var identityPaths = []string{
@@ -77,7 +87,15 @@ func (n *Node) IsIgnored() (bool, error) {
 	nodeIgnoredCheckTotal.Inc()
 
 	// Check if any dependency is ignored (contagious).
+	// Exception: state nodes in Satisfied or Ready state do NOT propagate
+	// ignore — their storeName scope persists in status from prior reconcile
+	// cycles, and downstream nodes proceed using those values.
 	for _, dep := range n.deps {
+		// State nodes never propagate ignore contagiously. Their Satisfied
+		// state means "includeWhen was false but stored values are still valid".
+		if dep.Spec.Meta.Type == graph.NodeTypeState {
+			continue
+		}
 		ignored, err := dep.IsIgnored()
 		if err != nil {
 			return false, err
@@ -203,6 +221,11 @@ func (n *Node) GetDesired() (result []*unstructured.Unstructured, err error) {
 		// metadata (name, namespace, selector). The caller extracts
 		// the resolved selector for LIST operations.
 		result, err = n.hardResolveSingleResource(n.templateVars)
+	case graph.NodeTypeState:
+		// State nodes do not produce desired Kubernetes resources.
+		// Their reconciliation is handled by processStateNode in the controller.
+		// Return an empty result — GetDesired is not the right entry point for state.
+		return nil, nil
 	default:
 		panic(fmt.Sprintf("unknown node type: %v", n.Spec.Meta.Type))
 	}
@@ -316,6 +339,64 @@ func (n *Node) DeleteTargets() ([]*unstructured.Unstructured, error) {
 	default:
 		panic(fmt.Sprintf("unknown node type: %v", n.Spec.Meta.Type))
 	}
+}
+
+// EvaluateStateFields evaluates all state field expressions for a state node
+// against the current in-memory instance (status-aware context). Returns a map
+// of field names to their computed values.
+//
+// State nodes use a status-aware context that includes schema.status.* values,
+// unlike template expressions which strip status entirely.
+func (n *Node) EvaluateStateFields() (map[string]interface{}, error) {
+	if n.Spec.Meta.Type != graph.NodeTypeState {
+		return nil, fmt.Errorf("EvaluateStateFields called on non-state node %q", n.Spec.Meta.ID)
+	}
+
+	ctx := n.buildContextWithStatus()
+
+	results := make(map[string]interface{}, len(n.stateFieldExprs))
+	for _, sf := range n.stateFieldExprs {
+		val, err := sf.Expression.Expression.Eval(ctx)
+		if err != nil {
+			if isCELDataPending(err) {
+				return nil, fmt.Errorf("state node %q field %q: %w (%w)", n.Spec.Meta.ID, sf.FieldName, err, ErrDataPending)
+			}
+			return nil, fmt.Errorf("state node %q field %q: %w", n.Spec.Meta.ID, sf.FieldName, err)
+		}
+		results[sf.FieldName] = val
+	}
+	return results, nil
+}
+
+// buildContextWithStatus builds a CEL activation context that includes
+// status.<storeName> values from the in-memory instance. This is used for
+// state node expressions which need to read stored values from prior cycles.
+//
+// Unlike buildContext() which calls withStatusOmitted() on the instance node,
+// this variant includes the full instance object (spec + metadata + status)
+// so that expressions like schema.status.<storeName>.<field> resolve correctly.
+func (n *Node) buildContextWithStatus() map[string]any {
+	ctx := make(map[string]any)
+	for depID, dep := range n.deps {
+		// Use nil check (not len==0) to include empty collections in context.
+		if dep.observed == nil {
+			continue
+		}
+		if dep.Spec.Meta.Type == graph.NodeTypeCollection || dep.Spec.Meta.Type == graph.NodeTypeExternalCollection {
+			items := make([]any, len(dep.observed))
+			for i, obj := range dep.observed {
+				items[i] = wrapWithSchema(obj.Object, dep.resourceSchema)
+			}
+			ctx[depID] = items
+		} else {
+			// For the instance node (depID == "schema"), this deliberately
+			// does NOT call withStatusOmitted(), unlike buildContext().
+			// State nodes need access to status.<storeName> fields.
+			obj := dep.observed[0].Object
+			ctx[depID] = wrapWithSchema(obj, dep.resourceSchema)
+		}
+	}
+	return ctx
 }
 
 func (n *Node) hardResolveSingleResource(vars []*variable.ResourceField) ([]*unstructured.Unstructured, error) {
@@ -588,8 +669,16 @@ func (n *Node) SetObserved(observed []*unstructured.Unstructured) {
 
 // CheckReadiness evaluates readyWhen expressions using observed state.
 // Ignored nodes are treated as ready for dependency gating purposes.
+// State nodes are handled by the controller (processStateNode) and do not
+// participate in observed-readiness checks.
 func (n *Node) CheckReadiness() error {
 	nodeReadyCheckTotal.Inc()
+
+	// State nodes are ready when their expressions evaluate and the status
+	// patch succeeds. This is tracked by the controller via SetReady/SetSatisfied.
+	if n.Spec.Meta.Type == graph.NodeTypeState {
+		return nil
+	}
 
 	// Ignored nodes are satisfied for dependency gating - dependents shouldn't block.
 	ignored, err := n.IsIgnored()

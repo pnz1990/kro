@@ -70,6 +70,14 @@ func (st *NodeState) SetWaitingForReadiness(err error) {
 	st.Err = err
 }
 
+// SetSatisfied marks a state node whose includeWhen is false. Unlike SetSkipped,
+// Satisfied does not propagate ignore contagiously — downstream nodes proceed
+// using storeName values from prior reconcile cycles.
+func (st *NodeState) SetSatisfied() {
+	st.State = v1alpha1.NodeStateSatisfied
+	st.Err = nil
+}
+
 // StateManager tracks instance and node states during reconciliation.
 // It is not safe for concurrent use; reconciliation processes nodes sequentially.
 type StateManager struct {
@@ -123,7 +131,7 @@ func (s *StateManager) Update() {
 		switch st.State {
 		case v1alpha1.NodeStateError:
 			hasError = true
-		case v1alpha1.NodeStateSynced, v1alpha1.NodeStateSkipped, v1alpha1.NodeStateDeleted:
+		case v1alpha1.NodeStateSynced, v1alpha1.NodeStateSkipped, v1alpha1.NodeStateDeleted, v1alpha1.NodeStateSatisfied:
 			// terminal/success states
 		default:
 			allSynced = false

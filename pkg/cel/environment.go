@@ -124,6 +124,10 @@ func BaseDeclarations() []cel.EnvOption {
 			// (includeWhen, readyWhen, forEach) via inspectExpressionRestricted
 			// and validateAndCompileForEach.
 			library.Omit(),
+			// KState() provides kstate(scope, field, default) for safe access
+			// to state node storage scopes. Typed overloads for int/string/bool
+			// ensure return type matches the default's type at compile time.
+			library.KState(),
 		}
 	})
 	return cachedBaseDeclarations

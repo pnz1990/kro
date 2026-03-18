@@ -142,3 +142,35 @@ func SetCRDStatus(crd *extv1.CustomResourceDefinition, status extv1.JSONSchemaPr
 		crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["status"] = status
 	}
 }
+
+// InjectStateFields adds x-kubernetes-preserve-unknown-fields: true under
+// status.<storeName> for each declared storeName. This ensures the API server
+// does not silently discard fields written by state nodes during UpdateStatus
+// calls. Multiple state nodes targeting the same storeName result in exactly
+// one injection.
+func InjectStateFields(crd *extv1.CustomResourceDefinition, storeNames []string) {
+	if len(storeNames) == 0 || len(crd.Spec.Versions) == 0 {
+		return
+	}
+	schema := crd.Spec.Versions[0].Schema
+	if schema == nil || schema.OpenAPIV3Schema == nil {
+		return
+	}
+	statusProps, ok := schema.OpenAPIV3Schema.Properties["status"]
+	if !ok {
+		return
+	}
+	if statusProps.Properties == nil {
+		statusProps.Properties = make(map[string]extv1.JSONSchemaProps)
+	}
+	preserveUnknown := true
+	for _, name := range storeNames {
+		if _, exists := statusProps.Properties[name]; !exists {
+			statusProps.Properties[name] = extv1.JSONSchemaProps{
+				Type:                   "object",
+				XPreserveUnknownFields: &preserveUnknown,
+			}
+		}
+	}
+	schema.OpenAPIV3Schema.Properties["status"] = statusProps
+}

@@ -163,6 +163,18 @@ func (c *Controller) updateStatus(rcx *ReconcileContext) error {
 		if err != nil {
 			return err
 		}
+
+		// Preserve storeName values from the live CR. State nodes write to
+		// status.<storeName> earlier in the cycle; the freshly-built status
+		// map does not include those values. Re-read from the live CR on
+		// each retry attempt to avoid overwriting concurrent state writes.
+		for _, storeName := range rcx.Runtime.DeclaredStoreNames() {
+			storeVal, found, _ := unstructured.NestedMap(cur.Object, "status", storeName)
+			if found && storeVal != nil {
+				status[storeName] = storeVal
+			}
+		}
+
 		cur.Object["status"] = status
 		_, err = rcx.InstanceClient().UpdateStatus(rcx.Ctx, cur, metav1.UpdateOptions{})
 		return err

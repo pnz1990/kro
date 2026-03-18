@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	apiservercel "k8s.io/apiserver/pkg/cel"
 	"k8s.io/apiserver/pkg/cel/openapi"
@@ -267,6 +268,14 @@ func (b *Builder) NewResourceGraphDefinition(originalCR *v1alpha1.ResourceGraphD
 	}
 	celSchemas[SchemaVarName] = schemaWithoutStatus
 
+	// Collect declared storeNames from state nodes and validate them.
+	var declaredStoreNames []string
+	for _, node := range nodes {
+		if node.Meta.Type == NodeTypeState {
+			declaredStoreNames = append(declaredStoreNames, node.StoreName)
+		}
+	}
+
 	// Create a single typed CEL environment with all schemas for compilation.
 	// TypedEnvironmentWithProvider returns both the env and the DeclTypeProvider it
 	// creates internally, avoiding duplicate schema-to-DeclType conversions.
@@ -281,9 +290,25 @@ func (b *Builder) NewResourceGraphDefinition(originalCR *v1alpha1.ResourceGraphD
 	sessionCache := celcache.NewSessionCache()
 
 	// Validate and compile all resource CEL expressions.
+	// State nodes are compiled separately (parse-only, no type checking).
 	for id, node := range nodes {
+		if node.Meta.Type == NodeTypeState {
+			continue // State nodes compiled below
+		}
 		if err := validateAndCompileNode(b.celCache, sessionCache, node, inspector, typedEnv, schemas[id], typeProvider); err != nil {
 			return nil, fmt.Errorf("failed to validate resource %q: %w", id, err)
+		}
+	}
+
+	// Compile state node expressions in parse-only mode (no type checking).
+	// The typed CEL environment does not know about status.<storeName> fields
+	// at compile time, so type errors are caught at runtime.
+	for _, node := range nodes {
+		if node.Meta.Type != NodeTypeState {
+			continue
+		}
+		if err := compileStateNodeExpressions(sessionCache, inspectorEnv, inspector, node); err != nil {
+			return nil, fmt.Errorf("failed to compile state node %q: %w", node.Meta.ID, err)
 		}
 	}
 
@@ -314,6 +339,27 @@ func (b *Builder) NewResourceGraphDefinition(originalCR *v1alpha1.ResourceGraphD
 	// Update the CRD with the inferred status schema.
 	crd.SetCRDStatus(instanceCRD, *statusSchema, true)
 
+	// Validate storeNames against schema.status projection field names.
+	// This must happen after status schema is built to know the projection fields.
+	if len(declaredStoreNames) > 0 {
+		statusFieldNames := sets.NewString()
+		if statusSchema.Properties != nil {
+			for fieldName := range statusSchema.Properties {
+				statusFieldNames.Insert(fieldName)
+			}
+		}
+		for _, storeName := range declaredStoreNames {
+			if err := validateStoreName(storeName, statusFieldNames); err != nil {
+				return nil, fmt.Errorf("state node validation: %w", err)
+			}
+		}
+
+		// Inject x-kubernetes-preserve-unknown-fields under status.<storeName>
+		// for each declared storeName. This ensures the API server does not
+		// silently discard values written by state nodes during UpdateStatus.
+		crd.InjectStateFields(instanceCRD, declaredStoreNames)
+	}
+
 	// Create the instance node with status variables for runtime patching.
 	instance, err := buildInstanceNode(
 		rgd.Spec.Schema.Group,
@@ -337,13 +383,14 @@ func (b *Builder) NewResourceGraphDefinition(originalCR *v1alpha1.ResourceGraphD
 	resourceSchemas[InstanceNodeID] = schemaWithoutStatus
 
 	resourceGraphDefinition := &Graph{
-		DAG:              dag,
-		Instance:         instance,
-		Nodes:            nodes,
-		Resources:        nodes,
-		TopologicalOrder: topologicalOrder,
-		CRD:              instanceCRD,
-		ResourceSchemas:  resourceSchemas,
+		DAG:                dag,
+		Instance:           instance,
+		Nodes:              nodes,
+		Resources:          nodes,
+		TopologicalOrder:   topologicalOrder,
+		CRD:                instanceCRD,
+		ResourceSchemas:    resourceSchemas,
+		DeclaredStoreNames: declaredStoreNames,
 	}
 	return resourceGraphDefinition, nil
 }
@@ -373,6 +420,13 @@ func (b *Builder) buildRGResource(
 	// 1. Validate resource field combinations.
 	if err := validateCombinableResourceFields(rgResource); err != nil {
 		return nil, nil, fmt.Errorf("invalid combination of resource fields: %w", err)
+	}
+
+	// State nodes follow a separate construction path — they have no template,
+	// no GVR, no Kubernetes resource to resolve or apply. They evaluate CEL
+	// expressions and write computed values to status.<storeName>.
+	if rgResource.State != nil {
+		return b.buildStateNode(rgResource, order)
 	}
 
 	// 2. Unmarshal the resource into a map[string]interface{}.
@@ -505,6 +559,66 @@ func (b *Builder) buildRGResource(
 	return node, resourceSchema, nil
 }
 
+// buildStateNode constructs a Node for a state: resource definition.
+// State nodes have no template, no GVR, and no Kubernetes resource. They
+// evaluate CEL expressions and write results to status.<storeName> on the
+// instance CR.
+//
+// State field expressions are stored as raw strings at build time; they are
+// compiled in parse-only mode (no type checking) because the typed CEL
+// environment does not know about status.<storeName> fields at compile time.
+// Type errors are caught at runtime rather than at RGD admission time.
+func (b *Builder) buildStateNode(
+	rgResource *v1alpha1.Resource,
+	order int,
+) (*Node, *spec.Schema, error) {
+	stateFields := rgResource.State
+
+	// Validate that all field values are ${...}-wrapped CEL expressions.
+	for fieldName, expr := range stateFields.Fields {
+		trimmed := strings.TrimSpace(expr)
+		if !strings.HasPrefix(trimmed, "${") || !strings.HasSuffix(trimmed, "}") {
+			return nil, nil, fmt.Errorf("state node %q field %q: value must be a ${...}-wrapped CEL expression, got %q", rgResource.ID, fieldName, expr)
+		}
+	}
+
+	// Parse includeWhen expressions (state nodes support includeWhen).
+	includeWhen, err := parser.ParseConditionExpressions(rgResource.IncludeWhen)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to parse includeWhen expressions for state node %q: %v", rgResource.ID, err)
+	}
+
+	// Parse state field expressions — strip ${...} wrapper to get raw CEL.
+	stateFieldExprs := make(map[string]*krocel.Expression, len(stateFields.Fields))
+	for fieldName, rawExpr := range stateFields.Fields {
+		parsed, err := parser.ParseConditionExpressions([]string{rawExpr})
+		if err != nil {
+			return nil, nil, fmt.Errorf("state node %q field %q: failed to parse expression: %v", rgResource.ID, fieldName, err)
+		}
+		if len(parsed) != 1 {
+			return nil, nil, fmt.Errorf("state node %q field %q: expected exactly one expression", rgResource.ID, fieldName)
+		}
+		stateFieldExprs[fieldName] = parsed[0]
+	}
+
+	node := &Node{
+		Meta: NodeMeta{
+			ID:    rgResource.ID,
+			Index: order,
+			Type:  NodeTypeState,
+			// GVR is zero-value — state nodes have no Kubernetes resource
+			// Namespaced is false — state nodes operate on the instance's status
+		},
+		// Template is nil — state nodes have no resource template
+		IncludeWhen: includeWhen,
+		StoreName:   stateFields.StoreName,
+		StateFields: stateFieldExprs,
+	}
+
+	// Return nil schema — state nodes have no OpenAPI schema to resolve against.
+	return node, nil, nil
+}
+
 // buildDependencyGraph builds the dependency graph between the nodes in the
 // resource graph definition. The dependency graph is a directed acyclic graph
 // that represents the relationships between the nodes. The graph is used
@@ -528,6 +642,13 @@ func (b *Builder) buildDependencyGraph(
 
 		// Phase 1: Extract dependencies and classify variables
 		templateDeps, usedIterators, err := extractTemplateDependencies(inspector, node, iteratorNames)
+		if err != nil {
+			return nil, err
+		}
+
+		// State nodes extract dependencies from their state field expressions
+		// instead of template variables.
+		stateFieldDeps, err := extractStateFieldDependencies(inspector, node)
 		if err != nil {
 			return nil, err
 		}
@@ -559,10 +680,11 @@ func (b *Builder) buildDependencyGraph(
 		}
 
 		// Add all dependencies to node and DAG
-		allDeps := make([]string, 0, len(templateDeps)+len(forEachDeps)+len(includeWhenDeps))
+		allDeps := make([]string, 0, len(templateDeps)+len(forEachDeps)+len(includeWhenDeps)+len(stateFieldDeps))
 		allDeps = append(allDeps, templateDeps...)
 		allDeps = append(allDeps, forEachDeps...)
 		allDeps = append(allDeps, includeWhenDeps...)
+		allDeps = append(allDeps, stateFieldDeps...)
 		node.Meta.Dependencies = append(node.Meta.Dependencies, allDeps...)
 		if err := directedAcyclicGraph.AddDependencies(node.Meta.ID, allDeps); err != nil {
 			return nil, err
@@ -925,6 +1047,32 @@ func extractDependencies(inspector *ast.Inspector, expr *krocel.Expression, iter
 		return nil, nil, fmt.Errorf("uses unknown functions: %v", inspectionResult.UnknownFunctions)
 	}
 	return resourceDeps, iteratorRefs, nil
+}
+
+// extractStateFieldDependencies extracts resource dependencies from a state
+// node's field expressions. State nodes use StateFields (map[string]*Expression)
+// instead of template Variables. Returns nil for non-state nodes.
+func extractStateFieldDependencies(
+	inspector *ast.Inspector,
+	node *Node,
+) ([]string, error) {
+	if node.Meta.Type != NodeTypeState || len(node.StateFields) == 0 {
+		return nil, nil
+	}
+
+	var allDeps []string
+	for fieldName, expr := range node.StateFields {
+		nodeDeps, _, err := extractDependencies(inspector, expr, nil)
+		if err != nil {
+			return nil, fmt.Errorf("state node %q field %q: failed to extract dependencies: %w", node.Meta.ID, fieldName, err)
+		}
+		for _, dep := range nodeDeps {
+			if !slices.Contains(allDeps, dep) {
+				allDeps = append(allDeps, dep)
+			}
+		}
+	}
+	return allDeps, nil
 }
 
 // extractConditionDependencies extracts resource dependencies from condition
@@ -1410,6 +1558,49 @@ func collectNodeSchemas(nodes map[string]*Node, nodeSchemas map[string]*spec.Sch
 				result[id] = sch
 			}
 		}
+		// State nodes have no schema — skip
 	}
 	return result
+}
+
+// compileStateNodeExpressions compiles state field expressions and includeWhen
+// expressions for a state node. State field expressions are compiled in
+// parse-only mode using the inspector environment, not the typed environment,
+// because status.<storeName> fields are not known at compile time.
+//
+// includeWhen expressions on state nodes are compiled with the inspector
+// environment too — they can reference schema.* and upstream resources.
+func compileStateNodeExpressions(sessionCache *celcache.SessionCache, env *cel.Env, inspector *ast.Inspector, node *Node) error {
+	// Compile includeWhen expressions if present.
+	for _, expr := range node.IncludeWhen {
+		program, _, err := sessionCache.ParseCheckAndCompile(env, expr.Original)
+		if err != nil {
+			return fmt.Errorf("state node %q includeWhen expression %q: %w", node.Meta.ID, expr.UserExpression(), err)
+		}
+		expr.Program = program
+	}
+
+	// Compile state field expressions and reject omit() usage.
+	// omit() writes a sentinel value that is only meaningful in resource
+	// template expressions where the resolver strips it. State nodes write
+	// directly to status via UpdateStatus — omit() sentinels would be
+	// serialized as empty objects, which is silent data corruption.
+	for fieldName, expr := range node.StateFields {
+		// Inspect for omit() before compilation.
+		inspection, err := inspector.Inspect(expr.Original)
+		if err != nil {
+			return fmt.Errorf("state node %q field %q: failed to inspect expression: %w", node.Meta.ID, fieldName, err)
+		}
+		if inspection.UsesOmit() {
+			return fmt.Errorf("state node %q field %q: omit() cannot be used in state field expressions", node.Meta.ID, fieldName)
+		}
+
+		program, _, err := sessionCache.ParseCheckAndCompile(env, expr.Original)
+		if err != nil {
+			return fmt.Errorf("state node %q field %q expression %q: %w", node.Meta.ID, fieldName, expr.UserExpression(), err)
+		}
+		expr.Program = program
+	}
+
+	return nil
 }

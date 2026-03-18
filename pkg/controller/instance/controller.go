@@ -57,6 +57,10 @@ type ReconcileConfig struct {
 	DeletionPolicy string
 	// RGDConfig holds RGD runtime configuration parameters.
 	RGDConfig graph.RGDConfig
+	// MinStateNodeWriteInterval is the minimum interval between writes to the
+	// same storeName on the same instance. Prevents runaway write loops.
+	// Default: 100ms. Floor: 10ms.
+	MinStateNodeWriteInterval time.Duration
 }
 
 // Controller manages the reconciliation of a single instance of a ResourceGraphDefinition,
@@ -90,6 +94,10 @@ type Controller struct {
 	childResourceLabeler metadata.Labeler
 	reconcileConfig      ReconcileConfig
 	coordinator          *dynamiccontroller.WatchCoordinator
+
+	// stateRateLimiter enforces minimum write intervals for state nodes.
+	// Shared across all reconciles for this controller (per-RGD).
+	stateRateLimiter *stateNodeRateLimiter
 }
 
 // NewController constructs a new controller with static RGD.
@@ -103,6 +111,14 @@ func NewController(
 	childResourceLabeler metadata.Labeler,
 	coord *dynamiccontroller.WatchCoordinator,
 ) *Controller {
+	minInterval := reconcileConfig.MinStateNodeWriteInterval
+	if minInterval == 0 {
+		minInterval = 100 * time.Millisecond // default
+	} else if minInterval < 10*time.Millisecond {
+		// Hard floor: prevent pathological write loops. Values below 10ms
+		// are almost certainly a misconfiguration.
+		minInterval = 10 * time.Millisecond
+	}
 	return &Controller{
 		log:                  log,
 		client:               client,
@@ -112,6 +128,7 @@ func NewController(
 		childResourceLabeler: childResourceLabeler,
 		reconcileConfig:      reconcileConfig,
 		coordinator:          coord,
+		stateRateLimiter:     newStateNodeRateLimiter(minInterval),
 	}
 }
 

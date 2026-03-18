@@ -59,6 +59,10 @@ const (
 	// NodeTypeExternalCollection is an external reference with a label selector
 	// that matches multiple resources (read-only collection, not applied).
 	NodeTypeExternalCollection
+	// NodeTypeState is a virtual node that evaluates CEL expressions and writes
+	// the results to status.<storeName> on the instance CR. It creates no
+	// Kubernetes resource — its reconcile action is a status patch.
+	NodeTypeState
 )
 
 // String returns a human-readable string for the node type.
@@ -74,6 +78,8 @@ func (t NodeType) String() string {
 		return "Instance"
 	case NodeTypeExternalCollection:
 		return "ExternalCollection"
+	case NodeTypeState:
+		return "State"
 	default:
 		return "Unknown"
 	}
@@ -132,6 +138,15 @@ type Node struct {
 	// ForEach holds the forEach dimensions for collection resources.
 	// nil or empty means this is not a collection.
 	ForEach []ForEachDimension
+
+	// StoreName is the status sub-field this state node writes to.
+	// Only set for NodeTypeState nodes.
+	StoreName string
+
+	// StateFields holds the compiled CEL expressions for state node fields.
+	// Keys are field names, values are compiled CEL expressions.
+	// Only set for NodeTypeState nodes.
+	StateFields map[string]*krocel.Expression
 }
 
 // DeepCopy creates a deep copy of the Node.
@@ -153,6 +168,7 @@ func (n *Node) DeepCopy() *Node {
 		IncludeWhen: slices.Clone(n.IncludeWhen),
 		ReadyWhen:   slices.Clone(n.ReadyWhen),
 		ForEach:     slices.Clone(n.ForEach),
+		StoreName:   n.StoreName,
 	}
 
 	if n.Template != nil {
@@ -166,6 +182,14 @@ func (n *Node) DeepCopy() *Node {
 			exprCopy := *v.Expression
 			copyVar.Expression = &exprCopy
 			cp.Variables[i] = &copyVar
+		}
+	}
+
+	if n.StateFields != nil {
+		cp.StateFields = make(map[string]*krocel.Expression, len(n.StateFields))
+		for k, v := range n.StateFields {
+			exprCopy := *v
+			cp.StateFields[k] = &exprCopy
 		}
 	}
 

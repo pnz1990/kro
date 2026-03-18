@@ -206,6 +206,9 @@ func (c *Controller) removeFinalizer(rcx *ReconcileContext) error {
 		Namespace: rcx.Instance.GetNamespace(),
 	})
 
+	// Clean up rate limiter entries to prevent memory leaks.
+	c.stateRateLimiter.Cleanup(string(rcx.Instance.GetUID()))
+
 	patched, err := c.setUnmanaged(rcx, rcx.Instance)
 	if err != nil {
 		rcx.Mark.InstanceNotManaged("failed removing finalizer: %v", err)

@@ -183,3 +183,24 @@ func WithResourceCollection(
 		})
 	}
 }
+
+// WithStateResource adds a state node to the ResourceGraphDefinition.
+// State nodes evaluate CEL expressions and write results to status.<storeName>.
+// They have no template — only a storeName and a fields map of CEL expressions.
+func WithStateResource(
+	id string,
+	storeName string,
+	fields map[string]string,
+	includeWhen []string,
+) ResourceGraphDefinitionOption {
+	return func(rgd *krov1alpha1.ResourceGraphDefinition) {
+		rgd.Spec.Resources = append(rgd.Spec.Resources, &krov1alpha1.Resource{
+			ID:          id,
+			IncludeWhen: includeWhen,
+			State: &krov1alpha1.StateFields{
+				StoreName: storeName,
+				Fields:    fields,
+			},
+		})
+	}
+}

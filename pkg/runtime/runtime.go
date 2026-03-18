@@ -34,6 +34,16 @@ type Interface interface {
 
 	// Instance returns the instance node.
 	Instance() *Node
+
+	// DeclaredStoreNames returns the storeNames declared by state nodes in this RGD.
+	DeclaredStoreNames() []string
+
+	// NodeByID returns a runtime node by its ID, or nil if not found.
+	NodeByID(id string) *Node
+
+	// InvalidateDesiredCache clears cached desired results for the given nodes
+	// and the instance node, forcing re-evaluation on next GetDesired().
+	InvalidateDesiredCache(nodeIDs ...string)
 }
 
 // Runtime is the execution context for a single reconciliation.
@@ -44,6 +54,10 @@ type Runtime struct {
 	nodes     map[string]*Node
 	instance  *Node
 	rgdConfig graph.RGDConfig
+
+	// declaredStoreNames lists all distinct storeName values from state nodes
+	// in this RGD. Used for storeName preservation in updateStatus().
+	declaredStoreNames []string
 }
 
 // FromGraph creates a new Runtime from a Graph and instance.
@@ -58,9 +72,10 @@ func FromGraph(g *graph.Graph, instance *unstructured.Unstructured, rgdConfig gr
 	instanceObj := instance.DeepCopy()
 
 	rt := &Runtime{
-		order:     g.TopologicalOrder,
-		nodes:     make(map[string]*Node),
-		rgdConfig: rgdConfig,
+		order:              g.TopologicalOrder,
+		nodes:              make(map[string]*Node),
+		rgdConfig:          rgdConfig,
+		declaredStoreNames: g.DeclaredStoreNames,
 	}
 
 	// Expression cache for non-iteration expressions only.
@@ -139,6 +154,20 @@ func FromGraph(g *graph.Graph, instance *unstructured.Unstructured, rgdConfig gr
 			node.includeWhenExprs = append(node.includeWhenExprs, state)
 		}
 
+		// State nodes have no readyWhen or forEach, and use StateFields
+		// instead of template Variables. Wire up their field expressions
+		// as stateFieldExprs for EvaluateStateFields().
+		if node.Spec.Meta.Type == graph.NodeTypeState {
+			for fieldName, expr := range node.Spec.StateFields {
+				state := getOrCreateExpr(expr, variable.ResourceVariableKindDynamic, expr.References)
+				node.stateFieldExprs = append(node.stateFieldExprs, &stateFieldEvalState{
+					FieldName:  fieldName,
+					Expression: state,
+				})
+			}
+			continue
+		}
+
 		for _, expr := range node.Spec.ReadyWhen {
 			state := getOrCreateExpr(expr, variable.ResourceVariableKindReadyWhen, []string{id})
 			node.readyWhenExprs = append(node.readyWhenExprs, state)
@@ -178,4 +207,35 @@ func (r *Runtime) Nodes() []*Node {
 // Instance returns the instance node.
 func (r *Runtime) Instance() *Node {
 	return r.instance
+}
+
+// DeclaredStoreNames returns the storeNames declared by state nodes in this RGD.
+func (r *Runtime) DeclaredStoreNames() []string {
+	return r.declaredStoreNames
+}
+
+// NodeByID returns a runtime node by its ID, or nil if not found.
+// The instance node is not included — use Instance() for that.
+func (r *Runtime) NodeByID(id string) *Node {
+	return r.nodes[id]
+}
+
+// InvalidateDesiredCache clears the cached desired result for the given node IDs,
+// forcing them to re-evaluate on the next GetDesired() call. This is used after
+// state node writes to ensure downstream nodes see the freshly written status values.
+//
+// When called with no nodeIDs, only the instance node's desired cache is cleared.
+// This is sufficient because downstream nodes reference schema.status.* via the
+// instance node — clearing the instance causes re-evaluation of any expression
+// that reads status fields. A future optimization could scope invalidation to
+// only the transitive dependents of the state node that wrote.
+func (r *Runtime) InvalidateDesiredCache(nodeIDs ...string) {
+	for _, id := range nodeIDs {
+		if node, ok := r.nodes[id]; ok {
+			node.desired = nil
+		}
+	}
+	// Always invalidate the instance node's desired cache so that
+	// schema.status projections re-evaluate against the fresh instance.
+	r.instance.desired = nil
 }

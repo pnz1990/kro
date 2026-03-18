@@ -171,11 +171,31 @@ type ExternalRef struct {
 // +kubebuilder:validation:MaxProperties=1
 type ForEachDimension map[string]string
 
+// StateFields defines the CEL expressions for a state node.
+// Each entry maps a field name to a CEL expression that computes the field's value.
+// All values must be ${...}-wrapped CEL expressions.
+type StateFields struct {
+	// StoreName is the name of the field written under status on the instance CR.
+	// Must be a valid Go identifier. Cannot collide with kro-reserved names
+	// (state, conditions, managedResources) or with schema.status projection fields.
+	//
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z_][a-zA-Z0-9_]*$`
+	StoreName string `json:"storeName"`
+	// Fields maps field names to CEL expressions. Every value must be a ${...}-wrapped
+	// CEL expression. The computed values are written to status.<storeName>.<fieldName>.
+	//
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinProperties=1
+	Fields map[string]string `json:"fields"`
+}
+
 // Resource represents a Kubernetes resource that is part of the ResourceGraphDefinition.
-// Each resource can either be created using a template or reference an existing resource.
+// Each resource can either be created using a template, reference an existing resource,
+// or define a state node that writes computed values to the instance's status.
 // Resources can depend on each other through CEL expressions, creating a dependency graph.
 //
-// +kubebuilder:validation:XValidation:rule="(has(self.template) && !has(self.externalRef)) || (!has(self.template) && has(self.externalRef))",message="exactly one of template or externalRef must be provided"
+// +kubebuilder:validation:XValidation:rule="(has(self.template) ? 1 : 0) + (has(self.externalRef) ? 1 : 0) + (has(self.state) ? 1 : 0) == 1",message="exactly one of template, externalRef, or state must be provided"
 type Resource struct {
 	// ID is a unique identifier for this resource within the ResourceGraphDefinition.
 	// It is used to reference this resource in CEL expressions from other resources.
@@ -191,10 +211,17 @@ type Resource struct {
 	Template runtime.RawExtension `json:"template,omitempty"`
 	// ExternalRef references an existing resource in the cluster instead of creating one.
 	// This is useful for reading existing resources and using their values in other resources.
-	// Exactly one of template or externalRef must be provided.
+	// Exactly one of template, externalRef, or state must be provided.
 	//
 	// +kubebuilder:validation:Optional
 	ExternalRef *ExternalRef `json:"externalRef,omitempty"`
+	// State defines a virtual node that evaluates CEL expressions and writes the results
+	// to a named storage scope under status on the instance CR. The written values persist
+	// across reconcile cycles and are readable by subsequent CEL expressions.
+	// Exactly one of template, externalRef, or state must be provided.
+	//
+	// +kubebuilder:validation:Optional
+	State *StateFields `json:"state,omitempty"`
 	// ReadyWhen is a list of CEL expressions that determine when this resource is considered ready.
 	// All expressions must evaluate to true for the resource to be ready.
 	// If not specified, the resource is considered ready when it exists.

@@ -47,4 +47,9 @@ type Graph struct {
 	// Includes resource schemas (keyed by resource ID) and the instance schema
 	// (keyed by InstanceNodeID). Used at runtime for schema-aware CEL value conversion.
 	ResourceSchemas map[string]*spec.Schema
+
+	// DeclaredStoreNames lists all distinct storeName values declared by state
+	// nodes in this RGD. Used at runtime for storeName preservation in
+	// updateStatus() and for CRD schema injection at build time.
+	DeclaredStoreNames []string
 }

@@ -253,15 +253,47 @@ func validateKubernetesVersion(version string) error {
 func validateCombinableResourceFields(res *v1alpha1.Resource) error {
 	hasTemplate := len(res.Template.Raw) > 0 // Template is runtime.RawExtension (struct)
 	hasExternalRef := res.ExternalRef != nil // ExternalRef is a pointer
+	hasState := res.State != nil             // State is a pointer
 
-	if !hasTemplate && !hasExternalRef {
-		return fmt.Errorf("resource %q: exactly one of template or externalRef must be provided", res.ID)
+	count := 0
+	if hasTemplate {
+		count++
 	}
-	if hasExternalRef && hasTemplate {
-		return fmt.Errorf("resource %q: cannot use externalRef with template", res.ID)
+	if hasExternalRef {
+		count++
+	}
+	if hasState {
+		count++
+	}
+
+	if count != 1 {
+		return fmt.Errorf("resource %q: exactly one of template, externalRef, or state must be provided", res.ID)
 	}
 	if hasExternalRef && len(res.ForEach) > 0 {
 		return fmt.Errorf("resource %q: cannot use externalRef with forEach", res.ID)
+	}
+	if hasState && len(res.ForEach) > 0 {
+		return fmt.Errorf("resource %q: cannot use state with forEach", res.ID)
+	}
+	if hasState && len(res.ReadyWhen) > 0 {
+		return fmt.Errorf("resource %q: cannot use readyWhen with state nodes (state nodes are ready when expressions evaluate and status patch succeeds)", res.ID)
+	}
+	return nil
+}
+
+// reservedStoreNames lists storeName values that cannot be used because they
+// collide with kro-owned status fields.
+var reservedStoreNames = sets.NewString("state", "conditions", "managedResources")
+
+// validateStoreName checks that a state node's storeName is valid: it must be a
+// valid Go identifier, not collide with kro-reserved status fields, and not
+// collide with schema.status projection fields.
+func validateStoreName(storeName string, statusFieldNames sets.String) error {
+	if reservedStoreNames.Has(storeName) {
+		return fmt.Errorf("state.storeName %q is reserved by kro; choose a different name", storeName)
+	}
+	if statusFieldNames.Has(storeName) {
+		return fmt.Errorf("state.storeName %q conflicts with schema.status field %q; choose a different name", storeName, storeName)
 	}
 	return nil
 }

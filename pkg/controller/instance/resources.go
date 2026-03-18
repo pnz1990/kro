@@ -17,6 +17,7 @@ package instance
 import (
 	"errors"
 	"fmt"
+	"reflect"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -24,12 +25,14 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	apimachineryruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/kubernetes-sigs/kro/api/v1alpha1"
 	"github.com/kubernetes-sigs/kro/pkg/controller/instance/applyset"
 	"github.com/kubernetes-sigs/kro/pkg/dynamiccontroller"
 	"github.com/kubernetes-sigs/kro/pkg/graph"
 	"github.com/kubernetes-sigs/kro/pkg/metadata"
+	"github.com/kubernetes-sigs/kro/pkg/requeue"
 	"github.com/kubernetes-sigs/kro/pkg/runtime"
 )
 
@@ -248,12 +251,27 @@ func (c *Controller) processNode(
 		return nil, err
 	}
 	if ignored {
-		state.SetSkipped()
-		rcx.Log.V(2).Info("Skipping resource", "id", id, "reason", "ignored")
+		// State nodes use Satisfied instead of Skipped to avoid contagious ignore.
+		if node.Spec.Meta.Type == graph.NodeTypeState {
+			state.SetSatisfied()
+			rcx.Log.V(2).Info("State node satisfied (includeWhen false)", "id", id)
+		} else {
+			state.SetSkipped()
+			rcx.Log.V(2).Info("Skipping resource", "id", id, "reason", "ignored")
+		}
 		return []applyset.Resource{{
 			ID:        id,
 			SkipApply: true,
 		}}, nil
+	}
+
+	// State nodes skip GetDesired — they evaluate expressions directly
+	// via processStateNode and write to status.
+	if node.Spec.Meta.Type == graph.NodeTypeState {
+		if err := c.processStateNode(rcx, node, state); err != nil {
+			return nil, err
+		}
+		return nil, nil
 	}
 
 	desired, err := node.GetDesired()
@@ -291,6 +309,9 @@ func (c *Controller) processNode(
 			return nil, err
 		}
 		return resources, nil
+	case graph.NodeTypeState:
+		// Already handled above before GetDesired
+		panic("state node should have been handled before GetDesired")
 	case graph.NodeTypeInstance:
 		panic("instance node should not be processed for apply")
 	default:
@@ -635,6 +656,9 @@ func (c *Controller) processApplyResults(
 		case graph.NodeTypeExternal, graph.NodeTypeExternalCollection:
 			// External refs/collections handled before applyset.
 			continue
+		case graph.NodeTypeState:
+			// State nodes are handled in processStateNode before applyset.
+			continue
 		case graph.NodeTypeInstance:
 			panic("instance node should not be in apply results")
 		default:
@@ -800,6 +824,147 @@ func (c *Controller) processExternalCollectionNode(
 		"count", len(items),
 	)
 	return nil
+}
+
+// processStateNode evaluates a state node's CEL expressions and writes the
+// results to status.<storeName> on the instance CR. This is the core reconcile
+// action for state nodes — they create no Kubernetes resource.
+//
+// Flow:
+//  1. Evaluate all fields expressions against status-aware context
+//  2. Idempotency check: skip write if all values match current status
+//  3. Rate limit check: skip write if too recent, schedule RequeueAfter
+//  4. Merge computed values into status.<storeName>
+//  5. Issue UpdateStatus with conflict retry (re-evaluates on conflict)
+//  6. On success: update in-memory instance, invalidate downstream caches
+func (c *Controller) processStateNode(
+	rcx *ReconcileContext,
+	node *runtime.Node,
+	state *NodeState,
+) error {
+	id := node.Spec.Meta.ID
+	storeName := node.Spec.StoreName
+	rcx.Log.V(2).Info("Processing state node", "id", id, "storeName", storeName)
+
+	// 1. Evaluate all state field expressions.
+	computed, err := node.EvaluateStateFields()
+	if err != nil {
+		if runtime.IsDataPending(err) {
+			return fmt.Errorf("state node %q: %w", id, err)
+		}
+		stateNodeEvalErrorsTotal.WithLabelValues(id).Inc()
+		state.SetError(fmt.Errorf("state node %q CEL evaluation failed: %w", id, err))
+		return state.Err
+	}
+
+	// 2. Idempotency check: compare computed values against current status.
+	currentStore, _, _ := unstructured.NestedMap(rcx.Instance.Object, "status", storeName)
+	if valuesMatch(computed, currentStore) {
+		rcx.Log.V(3).Info("State node values unchanged, skipping write", "id", id, "storeName", storeName)
+		state.SetReady()
+		return nil
+	}
+
+	// 3. Rate limit check.
+	instanceUID := string(rcx.Instance.GetUID())
+	allowed, remaining := c.stateRateLimiter.Allow(instanceUID, storeName)
+	if !allowed {
+		rcx.Log.V(2).Info("State node write rate-limited",
+			"id", id, "storeName", storeName, "retryAfter", remaining)
+		state.SetReady() // Continue cycle with stale values
+		return requeue.NeededAfter(
+			fmt.Errorf("state node %q rate-limited", id),
+			remaining,
+		)
+	}
+
+	// 4-5. Merge and write via UpdateStatus with conflict retry.
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Re-fetch the live CR for a fresh resourceVersion.
+		cur, err := rcx.InstanceClient().Get(rcx.Ctx, rcx.Instance.GetName(), metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+
+		// On conflict retry, re-evaluate ALL expressions against the fresh CR.
+		// This is required because expressions may reference values that changed
+		// concurrently (e.g., step = schema.status.migration.step + 1).
+		if cur.GetResourceVersion() != rcx.Instance.GetResourceVersion() {
+			stateNodeConflictsTotal.WithLabelValues(id).Inc()
+			rcx.Runtime.Instance().SetObserved([]*unstructured.Unstructured{cur})
+			freshComputed, err := node.EvaluateStateFields()
+			if err != nil {
+				return fmt.Errorf("re-evaluation on conflict: %w", err)
+			}
+			computed = freshComputed
+		}
+
+		// Merge computed fields into current status.<storeName>.
+		currentStatus, _, _ := unstructured.NestedMap(cur.Object, "status")
+		if currentStatus == nil {
+			currentStatus = make(map[string]interface{})
+		}
+		storeMap, ok := currentStatus[storeName].(map[string]interface{})
+		if !ok {
+			storeMap = make(map[string]interface{})
+		}
+		for k, v := range computed {
+			storeMap[k] = v
+		}
+		currentStatus[storeName] = storeMap
+
+		if err := unstructured.SetNestedField(cur.Object, currentStatus, "status"); err != nil {
+			return fmt.Errorf("failed to set status: %w", err)
+		}
+
+		updated, err := rcx.InstanceClient().UpdateStatus(rcx.Ctx, cur, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+
+		// Update in-memory instance with the committed state.
+		rcx.Instance = updated
+		rcx.Runtime.Instance().SetObserved([]*unstructured.Unstructured{updated})
+		return nil
+	})
+	if err != nil {
+		state.SetError(fmt.Errorf("state node %q UpdateStatus failed: %w", id, err))
+		return state.Err
+	}
+
+	// 6. Record write time for rate limiting and invalidate downstream caches.
+	c.stateRateLimiter.RecordWrite(instanceUID, storeName)
+	stateNodeWritesTotal.WithLabelValues(id).Inc()
+	rcx.Runtime.InvalidateDesiredCache()
+
+	state.SetReady()
+	rcx.Log.V(2).Info("State node write succeeded", "id", id, "storeName", storeName)
+	return nil
+}
+
+// valuesMatch compares computed state field values against current stored values.
+// Returns true if all computed values match what's in the store (idempotent).
+// Uses reflect.DeepEqual which may produce false negatives for int64 vs float64
+// (CEL returns int64, API server returns float64 for JSON numbers). False negatives
+// cause an extra UpdateStatus call which is harmless — the idempotency check is
+// an optimization, not a correctness gate.
+func valuesMatch(computed map[string]interface{}, current map[string]interface{}) bool {
+	if len(computed) == 0 {
+		return true
+	}
+	if current == nil {
+		return false
+	}
+	for k, v := range computed {
+		existing, ok := current[k]
+		if !ok {
+			return false
+		}
+		if !reflect.DeepEqual(v, existing) {
+			return false
+		}
+	}
+	return true
 }
 
 // requestWatch registers a scalar watch request with the coordinator.

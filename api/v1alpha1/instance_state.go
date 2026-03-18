@@ -41,4 +41,9 @@ const (
 	NodeStateSynced              NodeState = "SYNCED"
 	NodeStateDeleted             NodeState = "DELETED"
 	NodeStateWaitingForReadiness NodeState = "WAITING_FOR_READINESS"
+	// NodeStateSatisfied indicates a state node whose includeWhen evaluated to false.
+	// Unlike Skipped, Satisfied does NOT propagate ignore contagiously —
+	// the storeName scope persists in status from prior reconcile cycles,
+	// and downstream nodes proceed using those values.
+	NodeStateSatisfied NodeState = "SATISFIED"
 )
